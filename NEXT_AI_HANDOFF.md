@@ -6,7 +6,7 @@ Lilt is a native Windows music player written in Rust and egui. The Rust project
 
 ## Current work
 
-The working tree now contains unreleased follow-up changes for the next MSI-only release:
+Version v0.2.13 contains the following MSI-only release changes:
 
 - Added streaming Ogg Opus decoding via `opus-pure`, including Opus streams stored in `.ogg` files. Seeking restarts and skips decoded samples because the codec reader has no arbitrary seek API.
 - Added a quiet startup check against the latest published GitHub release. If a newer release has a Windows x64 MSI, Lilt asks first; Update now downloads it and launches `msiexec`, while Later does nothing. Network/check failures are silent.
@@ -22,9 +22,9 @@ The follow-up source passed `cargo check` and `cmd /c build-release.bat` complet
 - `dist/Lilt-v0.2.13-windows-x64.zip` (local portable package)
 - `target/release/lilt-player.exe` (local build output)
 
-The user installed and tested the v0.2.13 MSI and reported that everything worked perfectly. They explicitly authorized the GitHub release. Publish only the MSI asset on GitHub; keep the EXE and ZIP as local build outputs. The existing published release is v0.2.12; create a new v0.2.13 tag rather than overwrite the old tag.
+The user installed and tested the v0.2.13 MSI and reported that everything worked perfectly. It is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.13 with exactly one asset: `Lilt-v0.2.13-windows-x64.msi`. The EXE and ZIP remain local build outputs. The v0.2.13 release tag points to commit `b2d3b07ef2ae077f58195b6b7ded1e0103ff6db5`.
 
-The user reported that Opus playback crashes. A direct decoder probe successfully decoded 11,171 packets from `C:\Users\ultim\Music\OPUS_Music2026\Abracadabra.opus`, but audio playback launched from the Codex terminal exits with `STATUS_INVALID_HANDLE` for both the new Opus source and a normal FLAC source. The terminal environment's audio output path prevented confirming playback; the user should test the installed MSI outside that environment.
+During development, playback launched from the Codex terminal exited with `STATUS_INVALID_HANDLE` for Opus and FLAC, although a direct decoder probe decoded 11,171 packets successfully. The user subsequently installed and tested the MSI and reported that it all worked perfectly. They plan to test the updater from a second Windows 11 device running v0.2.12; with v0.2.13 published, that device should prompt to download the MSI.
 
 No always-on logon process is required for Explorer integration. The MSI registers the context menu and default-app capabilities in per-user registry keys; Explorer reads those registrations without Lilt running at login.
 
