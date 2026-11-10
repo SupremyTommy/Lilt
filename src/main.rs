@@ -72,6 +72,13 @@ enum RepeatMode {
     One,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum NowPlayingTab {
+    #[default]
+    UpNext,
+    ForYou,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DeletedSongRecord {
     // FNV-1a 128 over the complete file contents. None means the file could not be read
@@ -481,6 +488,8 @@ struct PlayerApp {
     lyrics_error: Option<String>,
     queue: Vec<usize>,
     queue_collapsed: bool,
+    now_playing_expanded: bool,
+    now_playing_tab: NowPlayingTab,
     compact_mode: bool,
     current: Option<usize>,
     playback_offset: Duration,
@@ -600,6 +609,8 @@ impl PlayerApp {
             lyrics_error: None,
             queue: Vec::new(),
             queue_collapsed: !preferences.show_queue_on_start,
+            now_playing_expanded: false,
+            now_playing_tab: NowPlayingTab::UpNext,
             compact_mode: preferences.compact_mode,
             current: None,
             playback_offset: Duration::ZERO,
@@ -3187,6 +3198,388 @@ impl PlayerApp {
             }
         }
         artists.into_values().collect()
+    }
+
+    fn show_now_playing_view(&mut self, ui: &mut egui::Ui) {
+        let current_position = self.current;
+        let current_index = current_position
+            .and_then(|position| self.queue.get(position))
+            .copied();
+        let current_track = current_index
+            .and_then(|index| self.tracks.get(index))
+            .cloned();
+        let cover = current_index.and_then(|index| self.artwork_texture(ui.ctx(), index));
+        let accent = accent_color(&self.accent);
+
+        let mut suggestions = self.recommendations.clone();
+        suggestions.retain(|&index| {
+            Some(index) != current_index
+                && self.tracks.get(index).is_some_and(|track| {
+                    !self.disliked_songs.contains(&track.path)
+                        && !self.excluded_tracks.contains(&track.path)
+                })
+        });
+        if suggestions.len() < 12 {
+            for (index, track) in self.tracks.iter().enumerate() {
+                if Some(index) != current_index
+                    && !suggestions.contains(&index)
+                    && !self.disliked_songs.contains(&track.path)
+                    && !self.excluded_tracks.contains(&track.path)
+                {
+                    suggestions.push(index);
+                    if suggestions.len() >= 36 {
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(current) = &current_track {
+            suggestions.sort_by_key(|&index| {
+                self.tracks.get(index).map_or(2, |track| {
+                    if !current.genre.is_empty() && track.genre.eq_ignore_ascii_case(&current.genre)
+                    {
+                        0
+                    } else if !current.artist.is_empty()
+                        && track.artist.eq_ignore_ascii_case(&current.artist)
+                    {
+                        1
+                    } else {
+                        2
+                    }
+                })
+            });
+        }
+
+        let mut close_view = false;
+        let mut play_queue_position = None;
+        let mut play_recommendation = None;
+        let mut add_recommendation = None;
+        let mut play_radio = false;
+        let mut add_radio = false;
+        let mut like_current = false;
+        let mut dislike_current = false;
+
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(RichText::new("NOW PLAYING").small().strong().color(accent));
+                ui.heading("Your listening session");
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("Close player").clicked() {
+                    close_view = true;
+                }
+                if ui
+                    .selectable_label(self.now_playing_tab == NowPlayingTab::ForYou, "For you")
+                    .clicked()
+                {
+                    self.now_playing_tab = NowPlayingTab::ForYou;
+                }
+                if ui
+                    .selectable_label(self.now_playing_tab == NowPlayingTab::UpNext, "Up next")
+                    .clicked()
+                {
+                    self.now_playing_tab = NowPlayingTab::UpNext;
+                }
+            });
+        });
+        ui.add_space(10.0);
+
+        ui.columns(2, |columns| {
+            columns[0].vertical_centered(|ui| {
+                let art_size = (ui.available_width().min(ui.available_height() - 130.0) * 0.82)
+                    .clamp(170.0, 430.0);
+                if let Some(cover) = &cover {
+                    ui.add(
+                        egui::Image::new(cover)
+                            .fit_to_exact_size(Vec2::splat(art_size))
+                            .corner_radius(egui::CornerRadius::same(12)),
+                    );
+                } else {
+                    let (rect, _) =
+                        ui.allocate_exact_size(Vec2::splat(art_size), egui::Sense::hover());
+                    paint_cover_or_placeholder(ui, None, rect, current_index.unwrap_or(0));
+                }
+                ui.add_space(18.0);
+                if let Some(track) = &current_track {
+                    ui.label(
+                        RichText::new(&track.title)
+                            .size(24.0)
+                            .strong()
+                            .color(Color32::WHITE),
+                    );
+                    ui.label(
+                        RichText::new(display_credit(&track.artist))
+                            .size(16.0)
+                            .color(Color32::from_rgb(184, 187, 198)),
+                    );
+                    if !track.album.is_empty() {
+                        ui.label(RichText::new(&track.album).small().color(Color32::GRAY));
+                    }
+                    ui.add_space(12.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .add(
+                                egui::Button::image(
+                                    egui::Image::new(if self.liked_songs.contains(&track.path) {
+                                        &self.ui_icons["like"]
+                                    } else {
+                                        &self.ui_icons["like_outline"]
+                                    })
+                                    .fit_to_exact_size(Vec2::splat(22.0)),
+                                )
+                                .frame(false),
+                            )
+                            .on_hover_text("Like song")
+                            .clicked()
+                        {
+                            like_current = true;
+                        }
+                        if ui
+                            .add(
+                                egui::Button::image(
+                                    egui::Image::new(&self.ui_icons["dislike"])
+                                        .fit_to_exact_size(Vec2::splat(22.0)),
+                                )
+                                .selected(self.disliked_songs.contains(&track.path)),
+                            )
+                            .on_hover_text("Dislike song")
+                            .clicked()
+                        {
+                            dislike_current = true;
+                        }
+                        if ui.button("Start radio").clicked() {
+                            play_radio = true;
+                        }
+                        if ui.button("Add recommendations").clicked() {
+                            add_radio = true;
+                        }
+                    });
+                } else {
+                    ui.label(RichText::new("Nothing is playing").size(22.0).strong());
+                    ui.label("Start a song or mix and your player will appear here.");
+                }
+            });
+
+            egui::Frame::new()
+                .fill(Color32::from_rgb(17, 19, 26))
+                .corner_radius(egui::CornerRadius::same(14))
+                .inner_margin(egui::Margin::symmetric(16, 14))
+                .show(&mut columns[1], |ui| match self.now_playing_tab {
+                    NowPlayingTab::UpNext => {
+                        let start = current_position.unwrap_or(0);
+                        let queue_items = self
+                            .queue
+                            .iter()
+                            .enumerate()
+                            .skip(start)
+                            .filter_map(|(position, &index)| {
+                                self.tracks
+                                    .get(index)
+                                    .cloned()
+                                    .map(|track| (position, index, track))
+                            })
+                            .collect::<Vec<_>>();
+                        let queue_is_empty = queue_items.is_empty();
+                        ui.horizontal(|ui| {
+                            ui.heading("Up next");
+                            ui.label(
+                                RichText::new(format!("{} tracks", queue_items.len()))
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                        });
+                        ui.label(
+                            RichText::new("Your queue, followed by music picked for you.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("now-playing-up-next")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for (position, index, track) in queue_items {
+                                    let selected = Some(position) == current_position;
+                                    egui::Frame::new()
+                                        .fill(if selected {
+                                            accent.linear_multiply(0.18)
+                                        } else {
+                                            Color32::TRANSPARENT
+                                        })
+                                        .corner_radius(egui::CornerRadius::same(8))
+                                        .inner_margin(egui::Margin::symmetric(8, 5))
+                                        .show(ui, |ui| {
+                                            ui.horizontal(|ui| {
+                                                if let Some(texture) =
+                                                    self.artwork_texture(ui.ctx(), index)
+                                                {
+                                                    ui.add(
+                                                        egui::Image::new(&texture)
+                                                            .fit_to_exact_size(Vec2::splat(42.0))
+                                                            .corner_radius(
+                                                                egui::CornerRadius::same(5),
+                                                            ),
+                                                    );
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        Vec2::splat(42.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    paint_cover_or_placeholder(
+                                                        ui, None, rect, index,
+                                                    );
+                                                }
+                                                ui.vertical(|ui| {
+                                                    if ui
+                                                        .selectable_label(
+                                                            selected,
+                                                            RichText::new(&track.title).strong(),
+                                                        )
+                                                        .clicked()
+                                                    {
+                                                        play_queue_position = Some(position);
+                                                    }
+                                                    ui.label(
+                                                        RichText::new(display_credit(
+                                                            &track.artist,
+                                                        ))
+                                                        .small()
+                                                        .color(Color32::GRAY),
+                                                    );
+                                                });
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.label(
+                                                            RichText::new(format_time(
+                                                                track.duration,
+                                                            ))
+                                                            .small()
+                                                            .color(Color32::GRAY),
+                                                        );
+                                                    },
+                                                );
+                                            });
+                                        });
+                                }
+                                if queue_is_empty {
+                                    ui.add_space(18.0);
+                                    ui.label("Nothing is queued after this song.");
+                                    ui.label(
+                                        RichText::new("Switch to For you to build a radio queue.")
+                                            .small()
+                                            .color(Color32::GRAY),
+                                    );
+                                }
+                            });
+                    }
+                    NowPlayingTab::ForYou => {
+                        ui.horizontal(|ui| {
+                            ui.heading("Picked for you");
+                            if ui.button("▶  Play radio").clicked() {
+                                play_radio = true;
+                            }
+                            if ui.button("Add all").clicked() {
+                                add_radio = true;
+                            }
+                        });
+                        let context = current_track.as_ref().map_or_else(
+                            || "Based on your liked music and listening history.".to_string(),
+                            |track| {
+                                if !track.genre.is_empty() {
+                                    format!(
+                                        "A mix inspired by {} and {}.",
+                                        track.title, track.genre
+                                    )
+                                } else {
+                                    format!("A mix inspired by {}.", track.title)
+                                }
+                            },
+                        );
+                        ui.label(RichText::new(context).small().color(Color32::GRAY));
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .id_salt("now-playing-for-you")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for &index in suggestions.iter().take(36) {
+                                    let Some(track) = self.tracks.get(index).cloned() else {
+                                        continue;
+                                    };
+                                    ui.horizontal(|ui| {
+                                        if let Some(texture) = self.artwork_texture(ui.ctx(), index)
+                                        {
+                                            ui.add(
+                                                egui::Image::new(&texture)
+                                                    .fit_to_exact_size(Vec2::splat(42.0))
+                                                    .corner_radius(egui::CornerRadius::same(5)),
+                                            );
+                                        } else {
+                                            let (rect, _) = ui.allocate_exact_size(
+                                                Vec2::splat(42.0),
+                                                egui::Sense::hover(),
+                                            );
+                                            paint_cover_or_placeholder(ui, None, rect, index);
+                                        }
+                                        if ui
+                                            .selectable_label(
+                                                false,
+                                                RichText::new(format!(
+                                                    "{}\n{}",
+                                                    track.title,
+                                                    display_credit(&track.artist)
+                                                )),
+                                            )
+                                            .clicked()
+                                        {
+                                            play_recommendation = Some(index);
+                                        }
+                                        if ui.small_button("Add").clicked() {
+                                            add_recommendation = Some(index);
+                                        }
+                                    });
+                                }
+                                if suggestions.is_empty() {
+                                    ui.label("Add music to your library to build recommendations.");
+                                }
+                            });
+                    }
+                });
+        });
+
+        if close_view {
+            self.now_playing_expanded = false;
+        }
+        if let Some(position) = play_queue_position {
+            self.play_queue_at(position);
+        }
+        if let Some(index) = play_recommendation {
+            self.queue_track_next(index);
+            let position = self.current.map_or(0, |current| current + 1);
+            if !self.queue.is_empty() {
+                self.play_queue_at(position.min(self.queue.len() - 1));
+            }
+        }
+        if let Some(index) = add_recommendation {
+            self.queue_track_next(index);
+        }
+        if add_radio {
+            self.add_tracks_to_queue(&suggestions);
+        }
+        if play_radio && !suggestions.is_empty() {
+            self.play_indices(suggestions, 0);
+            self.now_playing_tab = NowPlayingTab::UpNext;
+        }
+        if let Some(index) = current_index {
+            if like_current {
+                self.toggle_song_reaction(index, true);
+            }
+            if dislike_current {
+                self.toggle_song_reaction(index, false);
+            }
+        }
     }
 
     fn show_library(&mut self, ui: &mut egui::Ui) {
@@ -6658,8 +7051,8 @@ impl eframe::App for PlayerApp {
                 .and_then(|position| self.queue.get(position))
                 .and_then(|&index| self.tracks.get(index))
                 .map(|track| Duration::from_secs_f64(track.duration.max(0.0)));
-            let position = self.playback_offset
-                + self.sink.as_ref().map_or(Duration::ZERO, Sink::get_pos);
+            let position =
+                self.playback_offset + self.sink.as_ref().map_or(Duration::ZERO, Sink::get_pos);
             let until_end = duration
                 .map_or(Duration::from_secs(1), |duration| {
                     duration.saturating_sub(position)
@@ -6810,6 +7203,10 @@ impl eframe::App for PlayerApp {
                         }
                     }
                     ui.separator();
+                    if ui.button("Open Now Playing").clicked() {
+                        self.now_playing_expanded = true;
+                        ui.close_menu();
+                    }
                     if ui
                         .button(if self.queue_collapsed {
                             "Show Up next"
@@ -7050,7 +7447,7 @@ impl eframe::App for PlayerApp {
                     });
             });
 
-        if !self.queue_collapsed {
+        if !self.queue_collapsed && !self.now_playing_expanded {
             egui::SidePanel::right("up-next")
                 .resizable(true)
                 .default_width(310.0)
@@ -7481,7 +7878,7 @@ impl eframe::App for PlayerApp {
         }
 
         egui::TopBottomPanel::bottom("player-controls")
-            .exact_height(78.0)
+            .exact_height(88.0)
             .frame(egui::Frame::new().fill(Color32::BLACK).inner_margin(0))
             .show(ctx, |ui| {
                 ui.add_space(4.0);
@@ -7506,20 +7903,17 @@ impl eframe::App for PlayerApp {
                             .current
                             .and_then(|position| self.queue.get(position))
                             .copied();
+                        let current_track = current_track_index
+                            .and_then(|index| self.tracks.get(index))
+                            .cloned();
+                        let current_cover =
+                            current_track_index.and_then(|index| self.artwork_texture(ctx, index));
                         let current_track_liked = current_track_index
                             .and_then(|index| self.tracks.get(index))
                             .is_some_and(|track| self.liked_songs.contains(&track.path));
                         let current_track_disliked = current_track_index
                             .and_then(|index| self.tracks.get(index))
                             .is_some_and(|track| self.disliked_songs.contains(&track.path));
-                        let current_text = self
-                            .current
-                            .and_then(|position| self.queue.get(position))
-                            .and_then(|&index| self.tracks.get(index))
-                            .map(|track| {
-                                format!("{} · {}", track.title, display_credit(&track.artist))
-                            })
-                            .unwrap_or_else(|| "Nothing playing".into());
                         let mut like_current = false;
                         let mut dislike_current = false;
                         ui.vertical(|ui| {
@@ -7563,7 +7957,7 @@ impl eframe::App for PlayerApp {
                             let progress_end =
                                 progress_rect.left() + progress_rect.width() * progress;
                             let track_color = Color32::from_rgb(95, 103, 107);
-                            let played_color = Color32::from_rgb(255, 0, 51);
+                            let played_color = accent;
                             ui.painter().line_segment(
                                 [
                                     egui::pos2(progress_rect.left(), progress_y),
@@ -7596,38 +7990,38 @@ impl eframe::App for PlayerApp {
                                 format_time(duration)
                             ));
                             ui.horizontal_centered(|ui| {
-                                let is_playing_now = self
-                                    .sink
-                                    .as_ref()
-                                    .is_some_and(|sink| !sink.is_paused() && !sink.empty());
-                                let (meter_rect, _) = ui.allocate_exact_size(
-                                    Vec2::new(28.0, 24.0),
-                                    egui::Sense::hover(),
+                                let (cover_rect, cover_response) =
+                                    ui.allocate_exact_size(Vec2::splat(48.0), egui::Sense::click());
+                                paint_cover_or_placeholder(
+                                    ui,
+                                    current_cover.as_ref(),
+                                    cover_rect,
+                                    current_track_index.unwrap_or(0),
                                 );
-                                let phase = ctx.input(|input| input.time) as f32;
-                                for bar in 0..4 {
-                                    let wave = if is_playing_now {
-                                        (phase * 5.2 + bar as f32 * 1.35).sin() * 0.5 + 0.5
-                                    } else {
-                                        0.12
-                                    };
-                                    let height = 5.0 + wave * 15.0;
-                                    let x = meter_rect.left() + 2.0 + bar as f32 * 6.0;
-                                    let bar_rect = egui::Rect::from_min_size(
-                                        egui::pos2(x, meter_rect.center().y - height * 0.5),
-                                        Vec2::new(3.5, height),
-                                    );
-                                    ui.painter().rect_filled(
-                                        bar_rect,
-                                        egui::CornerRadius::same(2),
-                                        accent.linear_multiply(0.55 + wave * 0.45),
-                                    );
+                                if cover_response.clicked() {
+                                    self.now_playing_expanded = !self.now_playing_expanded;
                                 }
-                                ui.add_sized(
-                                    [190.0, 24.0],
-                                    egui::Label::new(RichText::new(current_text).strong())
+                                cover_response.on_hover_text("Open the expanded player");
+                                ui.vertical(|ui| {
+                                    let title = current_track
+                                        .as_ref()
+                                        .map_or("Nothing playing", |track| track.title.as_str());
+                                    ui.add_sized(
+                                        [190.0, 22.0],
+                                        egui::Label::new(RichText::new(title).strong()).truncate(),
+                                    );
+                                    let artist = current_track.as_ref().map_or_else(
+                                        || "Choose a mix or song".to_string(),
+                                        |track| display_credit(&track.artist),
+                                    );
+                                    ui.add_sized(
+                                        [190.0, 18.0],
+                                        egui::Label::new(
+                                            RichText::new(artist).small().color(Color32::GRAY),
+                                        )
                                         .truncate(),
-                                );
+                                    );
+                                });
                                 if ui
                                     .add_sized(
                                         [36.0, 34.0],
@@ -7701,24 +8095,14 @@ impl eframe::App for PlayerApp {
                                 {
                                     like_current = true;
                                 }
-                                let dislike_icon = if current_track_disliked {
-                                    "👎"
-                                } else {
-                                    "⊖"
-                                };
                                 if ui
                                     .add_enabled(
                                         current_track_index.is_some(),
-                                        egui::Button::new(
-                                            RichText::new(dislike_icon).size(18.0).color(
-                                                if current_track_disliked {
-                                                    Color32::from_rgb(255, 105, 105)
-                                                } else {
-                                                    Color32::GRAY
-                                                },
-                                            ),
+                                        egui::Button::image(
+                                            egui::Image::new(&self.ui_icons["dislike"])
+                                                .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
-                                        .frame(false),
+                                        .selected(current_track_disliked),
                                     )
                                     .on_hover_text(if current_track_disliked {
                                         "Remove dislike"
@@ -7778,10 +8162,9 @@ impl eframe::App for PlayerApp {
                                     };
                                     self.save_state();
                                 }
-                                ui.label(
-                                    RichText::new("🔊")
-                                        .size(14.0)
-                                        .color(Color32::from_rgb(175, 179, 190)),
+                                ui.add(
+                                    egui::Image::new(&self.ui_icons["volume_up"])
+                                        .fit_to_exact_size(Vec2::splat(17.0)),
                                 );
                                 let volume_response = ui
                                     .scope(|ui| {
@@ -7801,6 +8184,12 @@ impl eframe::App for PlayerApp {
                                     }
                                     self.save_state();
                                 }
+                                if ui.button("Queue").clicked() {
+                                    self.queue_collapsed = !self.queue_collapsed;
+                                }
+                                if ui.button("Expand").clicked() {
+                                    self.now_playing_expanded = true;
+                                }
                             });
                         });
                         if like_current {
@@ -7817,7 +8206,13 @@ impl eframe::App for PlayerApp {
                 ui.add_space(6.0);
             });
 
-        egui::CentralPanel::default().show(ctx, |ui| self.show_library(ui));
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.now_playing_expanded {
+                self.show_now_playing_view(ui);
+            } else {
+                self.show_library(ui);
+            }
+        });
 
         self.show_properties_window(ctx);
 

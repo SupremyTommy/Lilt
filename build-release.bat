@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-set "VERSION=0.2.3"
+set "VERSION=0.2.4"
 set "PACKAGE=dist\Lilt-v%VERSION%-windows-x64"
 set "ARCHIVE=dist\Lilt-v%VERSION%-windows-x64.zip"
 
