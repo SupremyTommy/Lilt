@@ -545,6 +545,10 @@ struct Preferences {
     online_artwork_prompt_seen: bool,
     #[serde(default)]
     developer_console_enabled: bool,
+    #[serde(default = "default_true")]
+    ai_audit_check_duplicates: bool,
+    #[serde(default = "default_true")]
+    ai_audit_check_artist_mismatches: bool,
 }
 
 impl Default for Preferences {
@@ -597,6 +601,8 @@ impl Default for Preferences {
             fetch_online_artwork: false,
             online_artwork_prompt_seen: false,
             developer_console_enabled: false,
+            ai_audit_check_duplicates: true,
+            ai_audit_check_artist_mismatches: true,
         }
     }
 }
@@ -782,7 +788,17 @@ struct AiMixCandidate {
     familiarity: &'static str,
 }
 
-type AiMixMessage = Result<(String, Vec<usize>, AiUsage), String>;
+type AiMixMessage = Result<(String, Vec<usize>, AiUsage, Option<String>), String>;
+
+#[derive(Clone, Debug)]
+struct AiAuditFinding {
+    kind: String,
+    track_ids: Vec<usize>,
+    suggested_artist: String,
+    explanation: String,
+}
+
+type AiAuditMessage = Result<(Vec<AiAuditFinding>, AiUsage), String>;
 
 #[derive(Clone, Copy)]
 enum MediaKeyCommand {
@@ -883,6 +899,9 @@ struct PlayerApp {
     search_suggestion_selection: usize,
     search_ai_pending: bool,
     search_ai_results: Vec<usize>,
+    search_ai_open: bool,
+    search_ai_answer: String,
+    search_suggestions_focused: bool,
     fetch_online_artwork: bool,
     online_artwork_prompt_seen: bool,
     online_artwork_prompt_open: bool,
@@ -999,6 +1018,13 @@ struct PlayerApp {
     ai_mix_status: String,
     ai_mix_receiver: Receiver<AiMixMessage>,
     ai_mix_sender: Sender<AiMixMessage>,
+    ai_audit_receiver: Receiver<AiAuditMessage>,
+    ai_audit_sender: Sender<AiAuditMessage>,
+    ai_audit_check_duplicates: bool,
+    ai_audit_check_artist_mismatches: bool,
+    ai_audit_pending: bool,
+    ai_audit_status: String,
+    ai_audit_findings: Vec<AiAuditFinding>,
     google_ai_key_draft: String,
     google_ai_key_saved: bool,
     developer_output_open: bool,
@@ -1050,6 +1076,7 @@ impl PlayerApp {
         let (artwork_sender, artwork_receiver) = mpsc::channel();
         let (media_key_sender, media_key_receiver) = mpsc::channel();
         let (ai_mix_sender, ai_mix_receiver) = mpsc::channel();
+        let (ai_audit_sender, ai_audit_receiver) = mpsc::channel();
         let (online_artwork_sender, online_artwork_receiver) = mpsc::channel();
         let (update_sender, update_receiver) = mpsc::channel();
         let update_check_sender = update_sender.clone();
@@ -1073,6 +1100,9 @@ impl PlayerApp {
             search_suggestion_selection: 0,
             search_ai_pending: false,
             search_ai_results: Vec::new(),
+            search_ai_open: false,
+            search_ai_answer: String::new(),
+            search_suggestions_focused: false,
             fetch_online_artwork: preferences.fetch_online_artwork,
             online_artwork_prompt_seen: preferences.online_artwork_prompt_seen,
             online_artwork_prompt_open: false,
@@ -1200,6 +1230,13 @@ impl PlayerApp {
             ai_mix_status: String::new(),
             ai_mix_receiver,
             ai_mix_sender,
+            ai_audit_receiver,
+            ai_audit_sender,
+            ai_audit_check_duplicates: preferences.ai_audit_check_duplicates,
+            ai_audit_check_artist_mismatches: preferences.ai_audit_check_artist_mismatches,
+            ai_audit_pending: false,
+            ai_audit_status: String::new(),
+            ai_audit_findings: Vec::new(),
             google_ai_key_draft: String::new(),
             google_ai_key_saved: google_ai_key_exists(),
             developer_output_open: false,
@@ -2737,6 +2774,16 @@ impl PlayerApp {
             }
         }
         let artist_jobs = artist_set.into_values().collect::<Vec<_>>();
+        let mut known_album_art_hashes = HashSet::new();
+        for artwork in self
+            .tracks
+            .iter()
+            .filter_map(|track| track.artwork.as_deref())
+        {
+            let mut hasher = DefaultHasher::new();
+            artwork.hash(&mut hasher);
+            known_album_art_hashes.insert(hasher.finish());
+        }
         if jobs.is_empty() && artist_jobs.is_empty() {
             self.online_artwork_status = "No tagged albums or artists need cover art.".into();
             return;
@@ -2749,6 +2796,7 @@ impl PlayerApp {
         let sender = self.online_artwork_sender.clone();
         #[cfg(windows)]
         thread::spawn(move || {
+            let mut known_album_art_hashes = known_album_art_hashes;
             let mut batch = Vec::with_capacity(50);
             for (position, (paths, artist, album)) in jobs.into_iter().enumerate() {
                 let cache_path = online_artwork_cache_path(&artist, &album);
@@ -2777,6 +2825,11 @@ impl PlayerApp {
                     }
                     let _ = fs::write(cache_path, bytes);
                 }
+                if let Some(bytes) = &bytes {
+                    let mut hasher = DefaultHasher::new();
+                    bytes.hash(&mut hasher);
+                    known_album_art_hashes.insert(hasher.finish());
+                }
                 batch.push((paths, bytes.map(Arc::new)));
                 if batch.len() >= 50 || position + 1 == total {
                     let _ = sender.send(OnlineArtworkResult {
@@ -2801,16 +2854,31 @@ impl PlayerApp {
             let mut artist_batch = Vec::with_capacity(50);
             for (position, artist) in artist_jobs.into_iter().enumerate() {
                 let cache_path = online_artist_art_cache_path(&artist);
-                let cached = cache_path
+                let mut cached = cache_path
                     .as_ref()
                     .ok()
                     .and_then(|path| fs::read(path).ok())
                     .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES);
+                if cached.as_ref().is_some_and(|bytes| {
+                    let mut hasher = DefaultHasher::new();
+                    bytes.hash(&mut hasher);
+                    known_album_art_hashes.contains(&hasher.finish())
+                }) {
+                    cached = None;
+                    if let Ok(path) = &cache_path {
+                        let _ = fs::remove_file(path);
+                    }
+                }
                 let bytes = if let Some(cached) = cached {
                     Some(cached)
                 } else {
                     let result = lookup_online_artist_art(&artist).ok().filter(|bytes| {
-                        !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES
+                        if bytes.is_empty() || bytes.len() > MAX_CACHED_ARTWORK_BYTES {
+                            return false;
+                        }
+                        let mut hasher = DefaultHasher::new();
+                        bytes.hash(&mut hasher);
+                        !known_album_art_hashes.contains(&hasher.finish())
                     });
                     thread::sleep(Duration::from_millis(1_050));
                     result
@@ -3374,6 +3442,8 @@ impl PlayerApp {
             fetch_online_artwork: self.fetch_online_artwork,
             online_artwork_prompt_seen: self.online_artwork_prompt_seen,
             developer_console_enabled: self.developer_console_enabled,
+            ai_audit_check_duplicates: self.ai_audit_check_duplicates,
+            ai_audit_check_artist_mismatches: self.ai_audit_check_artist_mismatches,
         }
     }
 
@@ -4875,8 +4945,8 @@ impl PlayerApp {
                 });
                 if !self.google_ai_key_saved {
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new("Add your own Google AI key in Settings → Advanced.").small().color(Color32::GRAY));
-                        if ui.small_button("Open settings").clicked() { self.page = Page::Settings; self.settings_advanced = true; }
+                        ui.label(RichText::new("Add your own Google AI key in Settings → AI.").small().color(Color32::GRAY));
+                        if ui.small_button("Open settings").clicked() { self.page = Page::Settings; self.settings_category = "AI".into(); self.settings_advanced = true; }
                     });
                 }
                 if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
@@ -6547,11 +6617,11 @@ impl PlayerApp {
                 if suggestions.len() >= 4 {
                     break;
                 }
-                if self
-                    .tracks
-                    .get(index)
-                    .is_some_and(|track| track.artist.eq_ignore_ascii_case(artists[0].as_str()))
-                {
+                if self.tracks.get(index).is_some_and(|track| {
+                    artist_names(&track.artist)
+                        .iter()
+                        .any(|name| name.eq_ignore_ascii_case(artists[0].as_str()))
+                }) {
                     suggestions.push(SearchSuggestion::Song(index));
                 }
             }
@@ -6615,8 +6685,11 @@ impl PlayerApp {
                 input.pointer.interact_pos(),
             )
         });
+        let search_field_focused =
+            ctx.memory(|memory| memory.focused() == Some(egui::Id::new("global-search")));
         if keyboard.3 {
             self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
             return;
         }
         if keyboard.4 {
@@ -6630,22 +6703,47 @@ impl PlayerApp {
                     .is_some_and(|layer| layer.id == egui::Id::new("live-search-suggestions"));
                 if !hovering_popup {
                     self.search_suggestions_open = false;
+                    self.search_suggestions_focused = false;
                 }
             }
         }
+        let empty_ai_row = suggestions.is_empty() && self.google_ai_key_saved;
+        let navigable_rows = suggestions.len().max(usize::from(empty_ai_row));
         if keyboard.0 {
-            self.search_suggestion_selection =
-                (self.search_suggestion_selection + 1) % suggestions.len().max(1);
+            if search_field_focused {
+                self.search_suggestions_focused = true;
+                self.search_suggestion_selection = 0;
+            } else if navigable_rows > 0 {
+                self.search_suggestion_selection =
+                    (self.search_suggestion_selection + 1) % navigable_rows;
+            }
         }
         if keyboard.1 {
-            self.search_suggestion_selection = self.search_suggestion_selection.saturating_sub(1);
+            if self.search_suggestions_focused && self.search_suggestion_selection == 0 {
+                self.search_suggestions_focused = false;
+                ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("global-search")));
+            } else if navigable_rows > 0 {
+                self.search_suggestion_selection =
+                    self.search_suggestion_selection.saturating_sub(1);
+            }
         }
         let mut play = None;
         let mut artist_open = None;
         let mut album_open = None;
         let mut ask_ai = false;
+        if keyboard.2 && self.search_suggestions_focused {
+            if empty_ai_row {
+                ask_ai = self.search_suggestion_selection == 0;
+            } else if let Some(suggestion) = suggestions.get(self.search_suggestion_selection) {
+                match suggestion {
+                    SearchSuggestion::Song(index) => play = Some((*index, songs.clone())),
+                    SearchSuggestion::Artist(artist) => artist_open = Some(artist.clone()),
+                    SearchSuggestion::Album(album, _) => album_open = Some(album.clone()),
+                }
+            }
+        }
         let available_height =
-            (ctx.screen_rect().bottom() - search_rect.bottom() - 20.0).clamp(140.0, 640.0);
+            (ctx.screen_rect().bottom() - search_rect.bottom() - 16.0).clamp(92.0, 520.0);
         let popup_width = search_rect
             .width()
             .max(620.0)
@@ -6664,6 +6762,7 @@ impl PlayerApp {
                         ui.set_min_width(popup_width);
                         ui.set_max_width(popup_width);
                         egui::ScrollArea::vertical()
+                            .auto_shrink([true, true])
                             .max_height(available_height)
                             .show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -6673,19 +6772,10 @@ impl PlayerApp {
                                                 .fit_to_exact_size(Vec2::splat(21.0)),
                                         );
                                     }
-                                    ui.label(RichText::new("Top matches").size(21.0).strong());
-                                    ui.label(
-                                        RichText::new("Best matches in your library")
-                                            .small()
-                                            .color(Color32::GRAY),
-                                    );
-                                    if self.google_ai_key_saved {
+                                    ui.label(RichText::new("Search").size(19.0).strong());
+                                    if !suggestions.is_empty() && self.google_ai_key_saved {
                                         if ui
-                                            .button(if self.search_ai_pending {
-                                                "Ask AI…"
-                                            } else {
-                                                "✦ Ask AI"
-                                            })
+                                            .button("Ask AI")
                                             .clicked()
                                             && !self.search_ai_pending
                                         {
@@ -6694,10 +6784,24 @@ impl PlayerApp {
                                     }
                                 });
                                 if suggestions.is_empty() {
-                                    ui.label(
-                                        RichText::new("No matching songs, artists, or albums")
-                                            .color(Color32::GRAY),
-                                    );
+                                    if empty_ai_row {
+                                        let selected = self.search_suggestion_selection == 0;
+                                        ui.horizontal(|ui| {
+                                            if let Some(icon) = self.ui_icons.get("sparkles") {
+                                                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(22.0)));
+                                            }
+                                            if ui.selectable_label(selected, RichText::new(format!("Ask AI about ‘{}’", query)).strong()).clicked() && !self.search_ai_pending {
+                                                ask_ai = true;
+                                            }
+                                        });
+                                    } else {
+                                        ui.horizontal(|ui| {
+                                            if let Some(icon) = self.ui_icons.get("search") {
+                                                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)));
+                                            }
+                                            ui.label(RichText::new("No matches. Try another title, artist, or album.").color(Color32::GRAY));
+                                        });
+                                    }
                                 }
                                 for (row, suggestion) in suggestions.iter().enumerate() {
                                     let selected = row == self.search_suggestion_selection;
@@ -6760,13 +6864,15 @@ impl PlayerApp {
                                     };
                                     let _ = clicked;
                                 }
-                                ui.label(
-                                    RichText::new(
-                                        "↑ ↓ navigate · Enter to see all results · Esc close",
-                                    )
-                                    .small()
-                                    .color(Color32::GRAY),
-                                );
+                                ui.horizontal(|ui| {
+                                    for (key, icon_key) in [("Down", "arrow_down"), ("Up", "arrow_up")] {
+                                        ui.label(RichText::new(key).small().color(Color32::GRAY));
+                                        if let Some(icon) = self.ui_icons.get(icon_key) {
+                                            ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(16.0)));
+                                        }
+                                    }
+                                    ui.label(RichText::new("Enter: search · Esc: close").small().color(Color32::GRAY));
+                                });
                             });
                     });
             });
@@ -6774,6 +6880,7 @@ impl PlayerApp {
             self.query = query.clone();
             self.page = Page::Home;
             self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
             let start = queue.iter().position(|&item| item == index).unwrap_or(0);
             self.play_indices(queue, start);
         }
@@ -6781,21 +6888,142 @@ impl PlayerApp {
             self.selected_artist = Some(artist);
             self.page = Page::ArtistDetail;
             self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
         }
         if let Some(album) = album_open {
             self.selected_album = Some(album);
             self.page = Page::AlbumDetail;
             self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
         }
         if ask_ai {
             self.search_ai_results.clear();
+            self.search_ai_answer.clear();
             self.search_ai_pending = true;
-            self.search_committed = true;
+            self.search_ai_open = true;
             self.ai_mix_prompt = query;
-            self.page = Page::Home;
+            self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
             self.request_ai_mix(ctx);
             if !self.ai_mix_pending {
                 self.search_ai_pending = false;
+                if self.search_ai_answer.is_empty() {
+                    self.search_ai_answer = self.ai_mix_status.clone();
+                }
+            }
+        }
+    }
+
+    fn show_search_ai_window(&mut self, context: &egui::Context) {
+        if !self.search_ai_open {
+            return;
+        }
+        let mut open = true;
+        let mut play = None;
+        egui::Window::new("Ask AI · Library search")
+            .id(egui::Id::new("search-ai-answer-window"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(560.0)
+            .default_height(420.0)
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .show(context, |ui| {
+                ui.horizontal(|ui| {
+                    if let Some(icon) = self.ui_icons.get("sparkles") {
+                        ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(24.0)));
+                    }
+                    ui.vertical(|ui| {
+                        ui.heading("Your music question");
+                        ui.label(
+                            RichText::new(self.query.trim())
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    });
+                });
+                ui.separator();
+                if self.search_ai_pending {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Looking through your library and writing an answer…");
+                    });
+                } else {
+                    egui::ScrollArea::vertical()
+                        .max_height(200.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(if self.search_ai_answer.is_empty() {
+                                    "I couldn't generate an answer. Please try again."
+                                } else {
+                                    &self.search_ai_answer
+                                })
+                                .size(16.0),
+                            );
+                        });
+                    ui.add_space(12.0);
+                    ui.heading("Songs from your library");
+                    if self.search_ai_results.is_empty() {
+                        ui.label(
+                            RichText::new("No matching songs were found in your library.")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    } else {
+                        for index in self.search_ai_results.clone() {
+                            let Some((title, artist, album)) =
+                                self.tracks.get(index).map(|track| {
+                                    (
+                                        track.title.clone(),
+                                        track.artist.clone(),
+                                        track.album.clone(),
+                                    )
+                                })
+                            else {
+                                continue;
+                            };
+                            ui.horizontal(|ui| {
+                                if let Some(cover) = self.artwork_texture(ui.ctx(), index) {
+                                    ui.add(
+                                        egui::Image::new(&cover)
+                                            .fit_to_exact_size(Vec2::splat(44.0)),
+                                    );
+                                } else {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        Vec2::splat(44.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    paint_cover_or_placeholder(ui, None, rect, index);
+                                }
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(title).strong());
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{} · {}",
+                                            display_metadata(&artist),
+                                            display_metadata(&album)
+                                        ))
+                                        .small()
+                                        .color(Color32::GRAY),
+                                    );
+                                });
+                                if ui.button("Play").clicked() {
+                                    play = Some(index);
+                                }
+                            });
+                        }
+                    }
+                }
+            });
+        self.search_ai_open = open;
+        if let Some(index) = play {
+            if let Some(position) = self
+                .search_ai_results
+                .iter()
+                .position(|&item| item == index)
+            {
+                self.play_indices(self.search_ai_results.clone(), position);
+                self.search_ai_open = false;
             }
         }
     }
@@ -8320,7 +8548,7 @@ impl PlayerApp {
     fn show_settings_content(&mut self, ui: &mut egui::Ui) {
         ui.label(
             RichText::new(
-                "Display, playback, and recommendation changes apply on Save. Folder changes take effect immediately.",
+                "Changes save automatically. Move a slider, then choose Save slider changes to apply it.",
             )
             .color(Color32::GRAY),
         );
@@ -8551,7 +8779,7 @@ impl PlayerApp {
         ui.add_space(14.0);
         ui.separator();
         ui.heading("Mix Studio");
-        ui.label(RichText::new("Use your own Google AI key for Mix Studio or optional AI-assisted recommendations. The key is stored in Windows Credential Manager. When you request a mix or refresh, a short prompt and up to 48 song titles, artists, genres, and liked/played/new tags are sent to Google; no file paths or audio are sent. Google usage limits and billing may apply.").small().color(Color32::GRAY));
+        ui.label(RichText::new("Use your own Google AI key for Mix Studio, search answers, or optional library review. The key is stored in Windows Credential Manager. AI requests send a prompt and compact music labels from your library; file paths and audio are never sent. Google usage limits and billing may apply.").small().color(Color32::GRAY));
         ui.horizontal(|ui| {
             ui.label("Google AI key");
             ui.add(egui::TextEdit::singleline(&mut self.google_ai_key_draft).password(true).hint_text("Paste your API key"));
@@ -8570,6 +8798,43 @@ impl PlayerApp {
         });
         ui.hyperlink_to("Get a Google AI key", "https://aistudio.google.com/app/apikey");
         if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
+        ui.add_space(18.0);
+        ui.separator();
+        ui.heading("AI library review");
+        ui.label(RichText::new("Ask Google to flag likely duplicate recordings and high-confidence artist-credit mistakes. It checks compact title, artist, and album labels across your library; file paths and audio are not sent. Nothing is changed automatically, and you should review suggestions before editing tags.").small().color(Color32::GRAY));
+        ui.checkbox(&mut draft.ai_audit_check_duplicates, "Look for duplicate songs and alternate copies");
+        ui.checkbox(&mut draft.ai_audit_check_artist_mismatches, "Look for songs credited to the wrong artist");
+        let can_audit = self.google_ai_key_saved && !self.ai_audit_pending && !self.tracks.is_empty();
+        let mut run_ai_audit = false;
+        ui.horizontal(|ui| {
+            if let Some(icon) = self.ui_icons.get("sparkles") {
+                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)));
+            }
+            run_ai_audit = ui.add_enabled(can_audit, egui::Button::new("Review my library")).clicked();
+        });
+        if run_ai_audit {
+            self.start_ai_library_audit(ui.ctx());
+        }
+        if self.ai_audit_pending {
+            ui.horizontal(|ui| { ui.spinner(); ui.label(&self.ai_audit_status); });
+        } else if !self.ai_audit_status.is_empty() {
+            ui.label(RichText::new(&self.ai_audit_status).color(accent_color(&self.accent)));
+        }
+        for finding in &self.ai_audit_findings {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                let heading = if finding.kind == "artist_mismatch" { "Possible artist-credit mistake" } else { "Possible duplicate recording" };
+                ui.label(RichText::new(heading).strong());
+                for id in &finding.track_ids {
+                    if let Some(track) = self.tracks.get(*id) {
+                        ui.label(format!("{} · {}", track.title, display_metadata(&track.artist)));
+                    }
+                }
+                if !finding.suggested_artist.is_empty() {
+                    ui.label(format!("Likely artist: {}", finding.suggested_artist));
+                }
+                ui.label(RichText::new(&finding.explanation).small().color(Color32::GRAY));
+            });
+        }
         }
         if advanced_settings {
         ui.add_space(14.0);
@@ -8824,20 +9089,58 @@ impl PlayerApp {
             .small()
             .color(accent_color(&self.accent)),
         );
-        self.settings_draft = Some(draft.clone());
+        let staged_sliders = (
+            draft.ui_scale,
+            draft.discovery,
+            draft.recommendation_variety,
+            draft.recommendation_size,
+            draft.volume,
+        );
+        let sliders_pending = (draft.ui_scale - self.ui_scale).abs() > f32::EPSILON
+            || (draft.discovery - self.discovery).abs() > f32::EPSILON
+            || (draft.recommendation_variety - self.recommendation_variety).abs() > f32::EPSILON
+            || draft.recommendation_size != self.recommendation_size
+            || (draft.volume - self.volume).abs() > f32::EPSILON;
         ui.horizontal(|ui| {
             save = ui
-                .add_sized([144.0, 42.0], egui::Button::new("Save changes"))
+                .add_enabled(sliders_pending, egui::Button::new("Save slider changes"))
                 .clicked();
             discard = ui
-                .add_sized([120.0, 42.0], egui::Button::new("Discard"))
+                .add_enabled(sliders_pending, egui::Button::new("Discard sliders"))
                 .clicked();
         });
+        let manual_save = save;
+        let auto_save = draft.view_mode != self.view_mode
+            || draft.album_view_mode != self.album_view_mode
+            || draft.artist_view_mode != self.artist_view_mode
+            || draft.accent != self.accent
+            || draft.shuffle != self.shuffle
+            || draft.repeat != self.repeat
+            || draft.show_queue_on_start != !self.queue_collapsed
+            || draft.compact_mode != self.compact_mode
+            || draft.start_maximized != self.start_maximized
+            || draft.animations_enabled != self.animations_enabled
+            || draft.developer_console_enabled != self.developer_console_enabled
+            || draft.ai_audit_check_duplicates != self.ai_audit_check_duplicates
+            || draft.ai_audit_check_artist_mismatches != self.ai_audit_check_artist_mismatches
+            || draft.fetch_online_artwork != self.fetch_online_artwork
+            || draft.lyrics_enabled != self.lyrics_enabled
+            || draft.prefer_unplayed != self.prefer_unplayed
+            || draft.scan_rate_per_second != self.scan_rate_per_second;
+        if auto_save && !manual_save {
+            draft.ui_scale = self.ui_scale;
+            draft.discovery = self.discovery;
+            draft.recommendation_variety = self.recommendation_variety;
+            draft.recommendation_size = self.recommendation_size;
+            draft.volume = self.volume;
+            save = true;
+        }
+        self.settings_draft = Some(draft.clone());
         if save {
             self.view_mode = draft.view_mode;
             self.album_view_mode = draft.album_view_mode;
             self.artist_view_mode = draft.artist_view_mode;
-            self.accent = draft.accent;
+            self.accent = draft.accent.clone();
             self.shuffle = draft.shuffle;
             self.repeat = draft.repeat;
             self.queue_collapsed = !draft.show_queue_on_start;
@@ -8845,6 +9148,8 @@ impl PlayerApp {
             self.start_maximized = draft.start_maximized;
             self.animations_enabled = draft.animations_enabled;
             self.developer_console_enabled = draft.developer_console_enabled;
+            self.ai_audit_check_duplicates = draft.ai_audit_check_duplicates;
+            self.ai_audit_check_artist_mismatches = draft.ai_audit_check_artist_mismatches;
             if !self.developer_console_enabled {
                 self.developer_output_open = false;
             }
@@ -8895,7 +9200,15 @@ impl PlayerApp {
             self.status = "Settings applied and saved.".into();
         } else if discard {
             self.settings_draft = None;
-            self.status = "Unapplied settings changes discarded.".into();
+            self.status = "Unapplied slider changes discarded.".into();
+        }
+        if auto_save && !manual_save {
+            draft.ui_scale = staged_sliders.0;
+            draft.discovery = staged_sliders.1;
+            draft.recommendation_variety = staged_sliders.2;
+            draft.recommendation_size = staged_sliders.3;
+            draft.volume = staged_sliders.4;
+            self.settings_draft = Some(draft);
         }
     }
 
@@ -8937,7 +9250,7 @@ impl PlayerApp {
         let api_key = match read_google_ai_key() {
             Ok(Some(key)) => key,
             Ok(None) => {
-                self.ai_mix_status = "Add your Google AI key in Settings → Advanced.".into();
+                self.ai_mix_status = "Add your Google AI key in Settings → AI.".into();
                 self.google_ai_key_saved = false;
                 return;
             }
@@ -9005,15 +9318,24 @@ impl PlayerApp {
         let repaint = context.clone();
         let model = self.google_ai_model;
         let thinking = self.google_ai_thinking;
+        let include_answer = self.search_ai_pending;
         let mix_size = if self.search_ai_pending {
             5
         } else {
             self.ai_mix_size
         };
         thread::spawn(move || {
-            let result =
-                generate_google_ai_mix(&api_key, &theme, &candidates, model, thinking, mix_size);
-            let _ = sender.send(result.map(|(indices, usage)| (theme, indices, usage)));
+            let result = generate_google_ai_mix(
+                &api_key,
+                &theme,
+                &candidates,
+                model,
+                thinking,
+                mix_size,
+                include_answer,
+            );
+            let _ =
+                sender.send(result.map(|(indices, usage, answer)| (theme, indices, usage, answer)));
             request_repaint_when_focused(&repaint);
         });
     }
@@ -9022,7 +9344,7 @@ impl PlayerApp {
         while let Ok(result) = self.ai_mix_receiver.try_recv() {
             self.ai_mix_pending = false;
             match result {
-                Ok((theme, indices, usage)) => {
+                Ok((theme, indices, usage, answer)) => {
                     self.google_ai_last_usage = Some(usage);
                     self.google_ai_usage.prompt_tokens = self
                         .google_ai_usage
@@ -9045,12 +9367,14 @@ impl PlayerApp {
                     self.ai_mix_results = indices.clone();
                     if self.search_ai_pending {
                         self.search_ai_results = indices.iter().copied().take(5).collect();
+                        self.search_ai_answer = answer.unwrap_or_else(|| {
+                            "I found a few songs in your library that fit your search.".into()
+                        });
                         self.search_ai_pending = false;
                         self.ai_mix_status = format!(
                             "AI found {} tracks for your search.",
                             self.search_ai_results.len()
                         );
-                        self.page = Page::Home;
                         self.search_suggestions_open = false;
                     } else if self.ai_recommendation_mode {
                         self.ai_recommendation_indices = indices;
@@ -9068,9 +9392,116 @@ impl PlayerApp {
                 }
                 Err(error) => {
                     self.ai_mix_status = error.clone();
-                    self.status = error;
+                    self.status = error.clone();
                     self.ai_recommendation_mode = false;
                     self.search_ai_pending = false;
+                    if self.search_ai_open {
+                        self.search_ai_answer = error.clone();
+                    }
+                }
+            }
+        }
+    }
+
+    fn start_ai_library_audit(&mut self, context: &egui::Context) {
+        if self.ai_audit_pending {
+            return;
+        }
+        let key = match read_google_ai_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.ai_audit_status = "Add a Google AI key in Settings → AI first.".into();
+                self.google_ai_key_saved = false;
+                return;
+            }
+            Err(error) => {
+                self.ai_audit_status = error;
+                return;
+            }
+        };
+        if !self.ai_audit_check_duplicates && !self.ai_audit_check_artist_mismatches {
+            self.ai_audit_status = "Choose at least one review option.".into();
+            return;
+        }
+        let catalog = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| !self.excluded_tracks.contains(&track.path))
+            .map(|(id, track)| {
+                format!(
+                    "{id}\t{}\t{}\t{}",
+                    compact_tsv_field(&compact_metadata(&track.title, 70)),
+                    compact_tsv_field(&compact_metadata(&display_credit(&track.artist), 55)),
+                    compact_tsv_field(&compact_metadata(&track.album, 55)),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        if catalog.is_empty() {
+            self.ai_audit_status = "Add music to your library before reviewing it.".into();
+            return;
+        }
+        self.ai_audit_pending = true;
+        self.ai_audit_status = format!("Reviewing {} catalog entries…", self.tracks.len());
+        self.ai_audit_findings.clear();
+        let check_duplicates = self.ai_audit_check_duplicates;
+        let check_artist = self.ai_audit_check_artist_mismatches;
+        let model = self.google_ai_model;
+        let thinking = self.google_ai_thinking;
+        let sender = self.ai_audit_sender.clone();
+        let repaint = context.clone();
+        thread::spawn(move || {
+            let result = generate_google_ai_audit(
+                &key,
+                &catalog,
+                check_duplicates,
+                check_artist,
+                model,
+                thinking,
+            );
+            let _ = sender.send(result);
+            request_repaint_when_focused(&repaint);
+        });
+    }
+
+    fn poll_ai_library_audit(&mut self) {
+        while let Ok(result) = self.ai_audit_receiver.try_recv() {
+            self.ai_audit_pending = false;
+            match result {
+                Ok((findings, usage)) => {
+                    self.google_ai_last_usage = Some(usage);
+                    self.google_ai_usage.prompt_tokens = self
+                        .google_ai_usage
+                        .prompt_tokens
+                        .saturating_add(usage.prompt_tokens);
+                    self.google_ai_usage.output_tokens = self
+                        .google_ai_usage
+                        .output_tokens
+                        .saturating_add(usage.output_tokens);
+                    self.google_ai_usage.thinking_tokens = self
+                        .google_ai_usage
+                        .thinking_tokens
+                        .saturating_add(usage.thinking_tokens);
+                    self.google_ai_usage.total_tokens = self
+                        .google_ai_usage
+                        .total_tokens
+                        .saturating_add(usage.total_tokens);
+                    self.google_ai_requests = self.google_ai_requests.saturating_add(1);
+                    self.ai_audit_findings = findings;
+                    self.ai_audit_status = if self.ai_audit_findings.is_empty() {
+                        "Review complete. No high-confidence issues were found.".into()
+                    } else {
+                        format!(
+                            "Review complete · {} item(s) need a look.",
+                            self.ai_audit_findings.len()
+                        )
+                    };
+                    self.save_state();
+                }
+                Err(error) => {
+                    self.ai_audit_status = error.clone();
+                    self.status = error;
                 }
             }
         }
@@ -9196,6 +9627,10 @@ impl PlayerApp {
                 include_bytes!("../assets/icons/ic-library-music-24px.svg"),
             ),
             (
+                "search",
+                include_bytes!("../assets/icons/ic-search-24px.svg"),
+            ),
+            (
                 "library_books",
                 include_bytes!("../assets/icons/ic-library-books-24px.svg"),
             ),
@@ -9235,6 +9670,18 @@ impl PlayerApp {
             (
                 "smart_mixes",
                 include_bytes!("../assets/icons/ic-smart-mixes-24px.svg"),
+            ),
+            (
+                "sparkles",
+                include_bytes!("../assets/icons/ic-auto-awesome-24px.svg"),
+            ),
+            (
+                "arrow_down",
+                include_bytes!("../assets/icons/ic-keyboard-arrow-down-24px.svg"),
+            ),
+            (
+                "arrow_up",
+                include_bytes!("../assets/icons/ic-keyboard-arrow-up-24px.svg"),
             ),
         ];
         for (name, bytes) in ICONS {
@@ -9366,6 +9813,7 @@ impl eframe::App for PlayerApp {
             self.poll_artwork(ctx);
             self.poll_online_artwork(ctx);
             self.poll_ai_mix();
+            self.poll_ai_library_audit();
         }
         // Windows media-key events arrive through the system media session and
         // must be serviced even while Lilt is in the background.
@@ -9897,8 +10345,12 @@ impl eframe::App for PlayerApp {
                     if search_response.changed() {
                         self.search_suggestions_open = !self.query.trim().is_empty();
                         self.search_suggestion_selection = 0;
+                        self.search_suggestions_focused = false;
                         self.search_ai_results.clear();
                         self.search_committed = false;
+                    }
+                    if self.search_suggestions_focused {
+                        search_response.surrender_focus();
                     }
                     search_focused = search_response.has_focus();
                     search_rect = Some(search_response.rect);
@@ -11001,6 +11453,7 @@ impl eframe::App for PlayerApp {
             }
         }
 
+        self.show_search_ai_window(ctx);
         self.show_properties_window(ctx);
 
         if self.online_artwork_prompt_open {
@@ -11044,11 +11497,13 @@ impl eframe::App for PlayerApp {
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.heading("Search");
-                        ui.label("Live search suggestions show matching songs, artists, and albums while you type. Ask AI can suggest up to five tracks from your local library when a Google AI key is configured.");
+                        ui.label("Live search shows five mixed song, artist, and album results, with compact empty states and Up/Down navigation. Enter in the search box opens full results; Enter on a selected suggestion opens it. Ask AI opens a separate answer panel with a short explanation and matching songs after it.");
                         ui.heading("Navigation");
-                        ui.label("The top bar restores individual menus when there is room and keeps them grouped on narrower windows. Keyboard shortcuts are available in Help.");
-                        ui.heading("Album art");
-                        ui.label("You can opt in to background cover lookup after scanning, or enable it later in Settings. Lookups are cached locally.");
+                        ui.label("The top bar restores individual menus when there is room and keeps them grouped on narrower windows. Keyboard shortcuts are always available; Down enters live results and Up returns to the search field.");
+                        ui.heading("AI library review");
+                        ui.label("Settings → AI can ask Google to flag likely duplicates and high-confidence wrong artist credits. It sends compact title, artist, and album labels only; it never changes tags automatically.");
+                        ui.heading("Artwork and settings");
+                        ui.label("Opt-in background lookups can fill missing album and artist images. Settings save immediately, while sliders wait for Save slider changes.");
                     });
                 });
             self.release_notes_open = open;
@@ -12535,12 +12990,52 @@ fn lookup_online_album_art(artist: &str, album: &str) -> Result<Vec<u8>, String>
 
 #[cfg(windows)]
 fn lookup_online_artist_art(artist: &str) -> Result<Vec<u8>, String> {
-    let path = format!("/w/api.php?action=query&format=json&formatversion=2&generator=search&gsrsearch={}&gsrnamespace=0&gsrlimit=1&prop=pageimages&piprop=thumbnail&pithumbsize=400&pilimit=1", url_encode_component(artist.trim()));
+    let path = format!("/w/api.php?action=query&format=json&formatversion=2&generator=search&gsrsearch={}&gsrnamespace=0&gsrlimit=8&prop=pageimages&piprop=thumbnail&pithumbsize=400&pilimit=1", url_encode_component(artist.trim()));
     let response = winhttp_get("en.wikipedia.org", &path, "application/json", 512 * 1024)?;
     let value: serde_json::Value = serde_json::from_slice(&response)
         .map_err(|_| "Wikipedia returned invalid artist image metadata.".to_string())?;
-    let source = value
-        .pointer("/query/pages/0/thumbnail/source")
+    let pages = value
+        .pointer("/query/pages")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| "Wikipedia found no artist pages.".to_string())?;
+    let normalized_artist = artist.trim().to_lowercase();
+    let unsuitable = [
+        "album",
+        "discography",
+        "song",
+        "single",
+        "soundtrack",
+        "film",
+        "record label",
+    ];
+    let page = pages
+        .iter()
+        .find(|page| {
+            page.get("title")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|title| title.eq_ignore_ascii_case(artist.trim()))
+                && page
+                    .pointer("/thumbnail/source")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+        })
+        .or_else(|| {
+            pages.iter().find(|page| {
+                let Some(title) = page.get("title").and_then(serde_json::Value::as_str) else {
+                    return false;
+                };
+                let title = title.to_lowercase();
+                title.contains(&normalized_artist)
+                    && !unsuitable.iter().any(|word| title.contains(word))
+                    && page
+                        .pointer("/thumbnail/source")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some()
+            })
+        })
+        .ok_or_else(|| "No matching artist portrait was found.".to_string())?;
+    let source = page
+        .pointer("/thumbnail/source")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| "No artist image was found.".to_string())?;
     let source = source
@@ -12669,6 +13164,152 @@ fn compact_tsv_field(value: &str) -> String {
         .collect()
 }
 
+fn generate_google_ai_audit(
+    key: &str,
+    catalog: &str,
+    check_duplicates: bool,
+    check_artist_mismatches: bool,
+    model: GeminiModel,
+    thinking: GeminiThinking,
+) -> Result<(Vec<AiAuditFinding>, AiUsage), String> {
+    let mut tasks = Vec::new();
+    if check_duplicates {
+        tasks.push("find only high-confidence duplicate recordings (same recording represented more than once; do not group covers, live versions, remixes, or different songs with common titles)");
+    }
+    if check_artist_mismatches {
+        tasks.push("find only obvious, high-confidence wrong artist credits using general music knowledge; for example Believer credited to an unrelated personal name instead of Imagine Dragons");
+    }
+    let prompt = format!(
+        "Review this user's local music metadata. {}. Return valid JSON only using {{\"findings\":[...]}}. A duplicate finding must use kind=\"duplicate\", ids=[two or more row IDs], explanation. An artist mismatch must use kind=\"artist_mismatch\", id, suggested_artist, explanation. Include only very high-confidence findings; do not guess on obscure songs, ambiguous titles, features, aliases, or legitimate alternate versions. Return an empty findings list when unsure. Never suggest editing files. Catalog columns: id, title, credited artist, album.\n{}",
+        tasks.join("; "), catalog
+    );
+    let body = serde_json::json!({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "thinkingConfig": {"thinkingLevel": thinking.id()},
+            "maxOutputTokens": 2048
+        }
+    });
+    let response = google_ai_post(key, &body.to_string(), model)?;
+    let value: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|_| "Google returned an unreadable library review. Try again.".to_string())?;
+    if let Some(message) = value
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+    {
+        return Err(format!(
+            "Google AI error: {}",
+            compact_metadata(message, 240)
+        ));
+    }
+    let usage_metadata = value
+        .get("usageMetadata")
+        .unwrap_or(&serde_json::Value::Null);
+    let usage = AiUsage {
+        prompt_tokens: usage_metadata
+            .get("promptTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage_metadata
+            .get("candidatesTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        thinking_tokens: usage_metadata
+            .get("thoughtsTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        total_tokens: usage_metadata
+            .get("totalTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    };
+    let text = value
+        .pointer("/candidates/0/content/parts")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let json_text = if cleaned.starts_with('{') && cleaned.ends_with('}') {
+        cleaned
+    } else if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        &cleaned[start..=end]
+    } else {
+        return Err("Google returned no library review results.".into());
+    };
+    let parsed: serde_json::Value = serde_json::from_str(json_text)
+        .map_err(|_| "Google's library review could not be read.".to_string())?;
+    let known_ids = catalog
+        .lines()
+        .filter_map(|line| line.split('\t').next()?.parse::<usize>().ok())
+        .collect::<HashSet<_>>();
+    let mut findings = Vec::new();
+    for finding in parsed
+        .get("findings")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let kind = finding
+            .get("kind")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+        let mut track_ids = if kind == "duplicate" {
+            finding
+                .get("ids")
+                .and_then(serde_json::Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_u64)
+                .map(|id| id as usize)
+                .filter(|id| known_ids.contains(id))
+                .collect::<Vec<_>>()
+        } else {
+            finding
+                .get("id")
+                .and_then(serde_json::Value::as_u64)
+                .map(|id| id as usize)
+                .filter(|id| known_ids.contains(id))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        track_ids.sort_unstable();
+        track_ids.dedup();
+        if (kind == "duplicate" && track_ids.len() < 2)
+            || (kind == "artist_mismatch" && track_ids.len() != 1)
+            || !matches!(kind, "duplicate" | "artist_mismatch")
+        {
+            continue;
+        }
+        findings.push(AiAuditFinding {
+            kind: kind.to_string(),
+            track_ids,
+            suggested_artist: finding
+                .get("suggested_artist")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| compact_metadata(s, 100))
+                .unwrap_or_default(),
+            explanation: finding
+                .get("explanation")
+                .and_then(serde_json::Value::as_str)
+                .map(|s| compact_metadata(s, 320))
+                .unwrap_or_else(|| "Review this suggestion.".into()),
+        });
+        if findings.len() >= 40 {
+            break;
+        }
+    }
+    Ok((findings, usage))
+}
+
 fn generate_google_ai_mix(
     key: &str,
     theme: &str,
@@ -12676,7 +13317,8 @@ fn generate_google_ai_mix(
     model: GeminiModel,
     thinking: GeminiThinking,
     mix_size: usize,
-) -> Result<(Vec<usize>, AiUsage), String> {
+    include_answer: bool,
+) -> Result<(Vec<usize>, AiUsage, Option<String>), String> {
     let catalog = candidates
         .iter()
         .enumerate()
@@ -12693,12 +13335,17 @@ fn generate_google_ai_mix(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let prompt = format!("Build a music mix for this request: {}. Select up to {} rows from the complete local catalog below. Match named artists and genres strictly. Never substitute unrelated artists or genres for a specific request; if no tracks match, return []. Otherwise choose a varied cohesive mix, avoiding too many tracks by one artist. Return only a JSON array of row IDs. Catalog columns: id, title, artist, genre, familiarity (L=liked, P=played, N=new).\n{}", compact_metadata(theme, 120), mix_size.clamp(4, 20), catalog);
+    let prompt = if include_answer {
+        format!("Answer the user's music question in one or two friendly, specific sentences using only the request and catalog below. Do not claim to know anything about the user beyond these local song labels. Then choose up to five relevant songs from the catalog. Match named artists and genres strictly; do not substitute unrelated tracks. Return valid JSON only with keys `answer` (string) and `ids` (array of catalog row IDs). If no local tracks match, explain that clearly and return an empty ids array. Request: {}\nCatalog columns: id, title, artist, genre, familiarity (L=liked, P=played, N=new).\n{}", compact_metadata(theme, 120), catalog)
+    } else {
+        format!("Build a music mix for this request: {}. Select up to {} rows from the complete local catalog below. Match named artists and genres strictly. Never substitute unrelated artists or genres for a specific request; if no tracks match, return []. Otherwise choose a varied cohesive mix, avoiding too many tracks by one artist. Return only a JSON array of row IDs. Catalog columns: id, title, artist, genre, familiarity (L=liked, P=played, N=new).\n{}", compact_metadata(theme, 120), mix_size.clamp(4, 20), catalog)
+    };
     let body = serde_json::json!({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
+            "responseMimeType": if include_answer { "application/json" } else { "text/plain" },
             "thinkingConfig": {"thinkingLevel": thinking.id()},
-            "maxOutputTokens": 64 + (mix_size.clamp(4, 20) as u64 * 5) + if thinking == GeminiThinking::Low { 64 } else { 0 }
+            "maxOutputTokens": if include_answer { 512 } else { 64 + (mix_size.clamp(4, 20) as u64 * 5) + if thinking == GeminiThinking::Low { 64 } else { 0 } }
         }
     });
     let response = google_ai_post(key, &body.to_string(), model)?;
@@ -12765,26 +13412,59 @@ fn generate_google_ai_mix(
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    let json_text = if cleaned.starts_with('[') && cleaned.ends_with(']') {
-        cleaned
-    } else if let (Some(start), Some(end)) = (cleaned.find('['), cleaned.rfind(']')) {
-        &cleaned[start..=end]
+    let (ids, answer): (Vec<usize>, Option<String>) = if include_answer {
+        let object_text = if cleaned.starts_with('{') && cleaned.ends_with('}') {
+            cleaned
+        } else if let (Some(start), Some(end)) = (cleaned.find('{'), cleaned.rfind('}')) {
+            &cleaned[start..=end]
+        } else {
+            return Err("Google's response did not contain an answer. Try again.".into());
+        };
+        let object: serde_json::Value = serde_json::from_str(object_text)
+            .map_err(|_| "Google's answer could not be read. Try again.".to_string())?;
+        let answer = object
+            .get("answer")
+            .and_then(serde_json::Value::as_str)
+            .map(|text| compact_metadata(text.trim(), 900))
+            .filter(|text| !text.is_empty())
+            .ok_or_else(|| "Google returned an empty answer. Try again.".to_string())?;
+        let ids = object
+            .get("ids")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(serde_json::Value::as_u64)
+                    .map(|id| id as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+        (ids, Some(answer))
     } else {
-        return Err("Google's response did not contain a song list. Try a simpler mood.".into());
+        let json_text = if cleaned.starts_with('[') && cleaned.ends_with(']') {
+            cleaned
+        } else if let (Some(start), Some(end)) = (cleaned.find('['), cleaned.rfind(']')) {
+            &cleaned[start..=end]
+        } else {
+            return Err(
+                "Google's response did not contain a song list. Try a simpler mood.".into(),
+            );
+        };
+        let ids: Vec<usize> = serde_json::from_str(json_text).map_err(|_| {
+            "Google's response was not a list of song ids. Try a simpler mood.".to_string()
+        })?;
+        (ids, None)
     };
-    let ids: Vec<usize> = serde_json::from_str(json_text).map_err(|_| {
-        "Google's response was not a list of song ids. Try a simpler mood.".to_string()
-    })?;
     let mut seen = HashSet::new();
     let indices = ids
         .into_iter()
         .filter(|id| *id < candidates.len() && seen.insert(*id))
         .map(|id| candidates[id].index)
         .collect::<Vec<_>>();
-    if indices.is_empty() {
+    if indices.is_empty() && !include_answer {
         Err("No matching tracks were found in your local library. Try a broader artist, genre, or mood.".into())
     } else {
-        Ok((indices, usage))
+        Ok((indices, usage, answer))
     }
 }
 

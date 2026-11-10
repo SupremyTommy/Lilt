@@ -17,13 +17,14 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
 
 - Background folder scanning, metadata, embedded album artwork, and library search
 - Optional missing album-cover and artist-portrait lookup through MusicBrainz/Cover Art Archive and Wikimedia. It runs in the background, updates progress every 50 items, and caches results locally. Album lookup applies to supported audio files with artist/album metadata.
-- Live typed search suggestions show at most five mixed song, artist, and album results with cover art; artist-name queries prioritize artist matches. Enter opens grouped Songs, Artists, Albums, and Recommendations results
-- Optional Ask AI search action uses a configured Google AI key to select up to five matching local tracks
+- Live typed search suggestions show at most five mixed song, artist, and album results with cover art; artist-name queries prioritize artist matches. Down enters results, Up returns to the search field, and Enter in the field opens grouped library search
+- Ask AI opens a separate answer panel with a short response and matching songs at the end; it uses a configured Google AI key
+- Optional AI library review can flag likely duplicate recordings and high-confidence artist-credit mistakes for manual review; it does not change tags automatically
 - Home and Discover pages with personalized recommendations, genre and decade mixes, and artist radio
 - Responsive File, Playback, View, Help, and Playlists menus in the title bar, with a grouped overflow menu on narrower windows; playlists remain available in the sidebar
 - Larger YouTube Music-inspired layout with Songs, Albums, Artists, Likes, Playlists,
   History, Disliked, Lyrics, and Settings navigation
-- Grid, details, and list views; Settings are grouped into Appearance, Playback, Library, Discover, AI, and Advanced sections, with Blue, Sky, Ice, Violet, Emerald, Rose, and Amber accent themes; customizable discovery balance, recommendation variety and
+- Grid, details, and list views; Settings are grouped into Appearance, Playback, Library, Discover, AI, and Advanced sections, with Blue, Sky, Ice, Violet, Emerald, Rose, and Amber accent themes. Settings auto-save except sliders, which use Save slider changes. Other controls include discovery balance, recommendation variety and
   size, unplayed-song priority, and library folders
 - Persistent song likes/dislikes, followed artists, saved albums, playlists, history, and preferences
 - Home Recommendations and New to you shelves personalized from liked music and listening history,
