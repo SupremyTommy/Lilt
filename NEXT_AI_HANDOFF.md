@@ -6,7 +6,7 @@ Lilt is a native Windows music player written in Rust and egui. The Rust project
 
 ## Current work
 
-Release `v0.2.11` is published. The v0.2.12 candidate fixes borderless window resizing and click handling:
+Release `v0.2.12` is published with fixes for borderless window resizing and click handling:
 
 - Smart Mixes has a dedicated icon at `assets/icons/ic-smart-mixes-24px.svg`.
 - The Smart Mixes page and navigation already use vertical scrolling.
@@ -27,13 +27,13 @@ For v0.2.8, `cmd /c build-release.bat` completed successfully and produced:
 - `dist/Lilt-v0.2.8-windows-x64.zip` (portable app package containing `lilt-player.exe`)
 - `target/release/lilt-player.exe`
 
-`cargo test` passed all 24 tests after the window interaction fix. `cargo run` was launched in debug mode and the user confirmed the behavior is fixed. Build v0.2.12 with `cmd /c build-release.bat` before publishing.
+`cargo test` passed all 24 tests after the window interaction fix. `cargo run` was launched in debug mode and the user confirmed the behavior is fixed. `cmd /c build-release.bat` completed successfully for v0.2.12.
 
 `cargo check` also passed. It reports an existing dead-code warning for `scan_folders`; release compilation reports the same warning. Build artifacts are ignored/untracked under `dist` and `target`.
 
 ## GitHub release status
 
-Release `v0.2.11` is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.11. GitHub verified the standalone EXE, MSI, and portable ZIP are uploaded. The release commit is `90f9e16`; the annotated tag is `v0.2.11`. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope. Publish the tested v0.2.12 artifacts next.
+Release `v0.2.12` is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.12. GitHub verified the standalone EXE, MSI, and portable ZIP are uploaded. The release commit is `cae2e42`; the annotated tag is `v0.2.12`. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope.
 
 The user's instruction is to publish the GitHub release through the terminal and to leave this handoff file in the Rust project folder.
 
