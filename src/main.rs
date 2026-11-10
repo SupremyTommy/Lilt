@@ -5,7 +5,7 @@ use std::{
     collections::{hash_map::DefaultHasher, BTreeMap, HashMap, HashSet, VecDeque},
     fs::{self, File},
     hash::{Hash, Hasher},
-    io::{BufReader, Read, Seek, SeekFrom},
+    io::{BufReader, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -19,6 +19,7 @@ use std::{
 use directories::ProjectDirs;
 use eframe::egui::{self, Color32, RichText, TextureHandle, Vec2};
 use lofty::{prelude::*, probe::Probe};
+use opus_pure::{OggOpusReader, OggPacket, OpusDecoder, Trim, MAX_PACKET_SAMPLES};
 use rodio::{Decoder, OutputStream, Sink, Source};
 use serde::{Deserialize, Serialize};
 use souvlaki::{MediaControlEvent, MediaControls, PlatformConfig};
@@ -27,7 +28,142 @@ const APP_NAME: &str = "Lilt";
 // Large embedded cover images are skipped to prevent libraries with huge art
 // from retaining gigabytes of duplicated image data in RAM.
 const MAX_CACHED_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
-const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "opus", "aac", "wma"];
+const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "opus", "aac"];
+
+/// Streaming Ogg Opus decoder. Decodes one packet at a time so long tracks do
+/// not need to be expanded into a multi-gigabyte PCM buffer before playback.
+struct OpusFileSource {
+    reader: OggOpusReader<BufReader<File>>,
+    decoder: OpusDecoder,
+    trim: Trim,
+    packet: OggPacket,
+    decoded: Vec<f32>,
+    pending: std::ops::Range<usize>,
+    channels: u16,
+    sample_rate: u32,
+    ended: bool,
+}
+
+#[derive(Clone, Debug)]
+struct UpdateInfo {
+    version: String,
+    download_url: String,
+}
+
+enum UpdateMessage {
+    Check(Result<Option<UpdateInfo>, String>),
+    Download(Result<(), String>),
+}
+
+impl OpusFileSource {
+    fn open(file: File) -> Result<Self, String> {
+        let reader = OggOpusReader::new(BufReader::new(file))
+            .map_err(|error| format!("Invalid Ogg Opus stream: {error}"))?;
+        let head = reader.head().clone();
+        let channels = head.channel_count as usize;
+        let decoder = head
+            .decoder(48_000)
+            .map_err(|error| format!("Could not initialize Opus decoder: {error}"))?;
+        let trim = Trim::new(&head, 48_000, channels)
+            .map_err(|error| format!("Could not prepare Opus stream: {error}"))?;
+        Ok(Self {
+            reader,
+            decoder,
+            trim,
+            packet: OggPacket::default(),
+            decoded: vec![0.0; MAX_PACKET_SAMPLES * channels],
+            pending: 0..0,
+            channels: channels as u16,
+            sample_rate: 48_000,
+            ended: false,
+        })
+    }
+}
+
+impl Iterator for OpusFileSource {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            if !self.pending.is_empty() {
+                let sample = self.decoded[self.pending.start];
+                self.pending.start += 1;
+                return Some(sample);
+            }
+            if self.ended {
+                return None;
+            }
+            let has_packet = match self.reader.read_packet_into(&mut self.packet) {
+                Ok(has_packet) => has_packet,
+                Err(_) => {
+                    self.ended = true;
+                    return None;
+                }
+            };
+            if !has_packet {
+                self.ended = true;
+                return None;
+            }
+            let frames =
+                match self
+                    .decoder
+                    .decode(&self.packet.data, MAX_PACKET_SAMPLES, &mut self.decoded)
+                {
+                    Ok(frames) => frames,
+                    Err(_) => {
+                        self.ended = true;
+                        return None;
+                    }
+                };
+            self.pending = self
+                .trim
+                .keep_range(&self.packet, frames * self.channels as usize);
+        }
+    }
+}
+
+impl Source for OpusFileSource {
+    fn current_frame_len(&self) -> Option<usize> {
+        None
+    }
+
+    fn channels(&self) -> u16 {
+        self.channels
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+fn open_audio_source(path: &Path) -> Result<Box<dyn Source<Item = f32> + Send>, String> {
+    let mut file = File::open(path).map_err(|error| error.to_string())?;
+    let extension_is_opus = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("opus"));
+    let mut probe = [0u8; 512];
+    let bytes_read = file.read(&mut probe).unwrap_or(0);
+    let contains_opus_head = probe[..bytes_read]
+        .windows(b"OpusHead".len())
+        .any(|window| window == b"OpusHead");
+    file.seek(SeekFrom::Start(0))
+        .map_err(|error| error.to_string())?;
+    let is_opus = extension_is_opus || contains_opus_head;
+    if is_opus {
+        return OpusFileSource::open(file)
+            .map(|source| Box::new(source) as Box<dyn Source<Item = f32> + Send>);
+    }
+    Decoder::new(BufReader::new(file))
+        .map(|source| {
+            Box::new(source.convert_samples::<f32>()) as Box<dyn Source<Item = f32> + Send>
+        })
+        .map_err(|error| error.to_string())
+}
 
 fn show_custom_window_controls(ui: &mut egui::Ui, context: &egui::Context) {
     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -397,6 +533,8 @@ struct Preferences {
     animations_enabled: bool,
     #[serde(default)]
     lyrics_enabled: bool,
+    #[serde(default)]
+    default_app_prompt_dismissed: bool,
 }
 
 impl Default for Preferences {
@@ -445,6 +583,7 @@ impl Default for Preferences {
             start_maximized: default_start_maximized(),
             animations_enabled: default_animations_enabled(),
             lyrics_enabled: false,
+            default_app_prompt_dismissed: false,
         }
     }
 }
@@ -824,6 +963,13 @@ struct PlayerApp {
     last_status_seen: String,
     splash_started: Instant,
     error_notification: Option<(String, Instant)>,
+    update_receiver: Receiver<UpdateMessage>,
+    update_sender: Sender<UpdateMessage>,
+    update_available: Option<UpdateInfo>,
+    update_downloading: bool,
+    update_notice: Option<String>,
+    default_app_prompt_open: bool,
+    pending_startup_file: Option<PathBuf>,
     #[cfg(target_os = "windows")]
     media_controls: Option<MediaControls>,
     #[cfg(target_os = "windows")]
@@ -833,14 +979,37 @@ struct PlayerApp {
 }
 
 impl PlayerApp {
+    #[cfg(test)]
     fn new() -> Self {
-        let (preferences, preference_error) = match load_preferences() {
+        Self::new_with_folder(None, None)
+    }
+
+    fn new_with_folder(startup_folder: Option<PathBuf>, startup_file: Option<PathBuf>) -> Self {
+        let (mut preferences, preference_error) = match load_preferences() {
             Ok(preferences) => (preferences, None),
             Err(error) => (Preferences::default(), Some(error)),
         };
+        let startup_folder = startup_folder.or_else(|| {
+            startup_file
+                .as_ref()
+                .filter(|file| file.is_file())
+                .and_then(|file| file.parent().map(Path::to_path_buf))
+        });
+        let add_startup_folder = startup_folder
+            .filter(|folder| folder.is_dir())
+            .filter(|folder| !preferences.folders.contains(folder));
+        if let Some(folder) = &add_startup_folder {
+            preferences.folders.push(folder.clone());
+        }
         let (artwork_sender, artwork_receiver) = mpsc::channel();
         let (media_key_sender, media_key_receiver) = mpsc::channel();
         let (ai_mix_sender, ai_mix_receiver) = mpsc::channel();
+        let (update_sender, update_receiver) = mpsc::channel();
+        let update_check_sender = update_sender.clone();
+        thread::spawn(move || {
+            let result = check_for_update();
+            let _ = update_check_sender.send(UpdateMessage::Check(result));
+        });
         let mut app = Self {
             tracks: Vec::new(),
             folders: preferences.folders,
@@ -976,6 +1145,13 @@ impl PlayerApp {
             last_status_seen: String::new(),
             splash_started: Instant::now(),
             error_notification: None,
+            update_receiver,
+            update_sender,
+            update_available: None,
+            update_downloading: false,
+            update_notice: None,
+            default_app_prompt_open: !preferences.default_app_prompt_dismissed,
+            pending_startup_file: startup_file.filter(|file| file.is_file()),
             #[cfg(target_os = "windows")]
             media_controls: None,
             #[cfg(target_os = "windows")]
@@ -986,6 +1162,10 @@ impl PlayerApp {
         if !app.folders.is_empty() {
             app.initial_library_loading = true;
             app.start_scan();
+        }
+        if add_startup_folder.is_some() {
+            app.status = "Added the File Explorer folder to your Lilt library.".into();
+            app.save_state();
         }
         app
     }
@@ -999,6 +1179,39 @@ impl PlayerApp {
             self.loaded_collection_items = 50;
         }
         self.loaded_collection_items.min(total)
+    }
+
+    fn poll_update_messages(&mut self) {
+        while let Ok(message) = self.update_receiver.try_recv() {
+            match message {
+                UpdateMessage::Check(Ok(Some(update))) => self.update_available = Some(update),
+                UpdateMessage::Check(Ok(None)) | UpdateMessage::Check(Err(_)) => {}
+                UpdateMessage::Download(result) => {
+                    self.update_downloading = false;
+                    match result {
+                        Ok(()) => {
+                            self.update_available = None;
+                            self.update_notice = Some(
+                                "The installer was opened. Follow the Windows Installer prompts to update Lilt.".into(),
+                            );
+                        }
+                        Err(error) => self.update_notice = Some(error),
+                    }
+                }
+            }
+        }
+    }
+
+    fn download_update(&mut self) {
+        let Some(update) = self.update_available.clone() else {
+            return;
+        };
+        self.update_downloading = true;
+        let sender = self.update_sender.clone();
+        thread::spawn(move || {
+            let result = download_and_open_update(&update);
+            let _ = sender.send(UpdateMessage::Download(result));
+        });
     }
 
     fn load_next_collection_batch(
@@ -1104,7 +1317,9 @@ impl PlayerApp {
             };
             if let Some(command) = command {
                 if sender.send(command).is_ok() {
-                    request_repaint_when_focused(&repaint_context);
+                    // Media keys are system-wide. Wake egui even while another
+                    // app has focus so the queued command is applied promptly.
+                    repaint_context.request_repaint();
                 }
             }
         }) {
@@ -2279,6 +2494,22 @@ impl PlayerApp {
                 if let Some(error) = result.error {
                     self.status = format!("{} · {error}", self.status);
                 }
+                if let Some(open_file) = self.pending_startup_file.take() {
+                    let wanted = fs::canonicalize(&open_file).unwrap_or(open_file.clone());
+                    if let Some(index) = self.tracks.iter().position(|track| {
+                        fs::canonicalize(&track.path)
+                            .map(|path| path == wanted)
+                            .unwrap_or_else(|_| track.path == open_file)
+                    }) {
+                        self.queue = vec![index];
+                        self.play_queue_at(0);
+                    } else {
+                        self.status = format!(
+                            "Could not open {} because it is not a supported audio file.",
+                            open_file.display()
+                        );
+                    }
+                }
                 if !auto_deleted_set.is_empty() {
                     self.save_state();
                 }
@@ -2873,6 +3104,7 @@ impl PlayerApp {
             start_maximized: self.start_maximized,
             animations_enabled: self.animations_enabled,
             lyrics_enabled: self.lyrics_enabled,
+            default_app_prompt_dismissed: !self.default_app_prompt_open,
         }
     }
 
@@ -3048,13 +3280,6 @@ impl PlayerApp {
             self.lyrics = None;
             self.lyrics_error = None;
         }
-        let file = match File::open(&track_path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.status = format!("Could not open {}: {error}", track_path.display());
-                return;
-            }
-        };
         let (stream, handle) = match OutputStream::try_default() {
             Ok(output) => output,
             Err(error) => {
@@ -3069,15 +3294,15 @@ impl PlayerApp {
                 return;
             }
         };
-        let decoder = match Decoder::new(BufReader::new(file)) {
-            Ok(decoder) => decoder,
+        let source = match open_audio_source(&track_path) {
+            Ok(source) => source,
             Err(error) => {
                 self.status = format!("Could not decode {}: {error}", track_path.display());
                 return;
             }
         };
         sink.set_volume(self.volume);
-        sink.append(decoder);
+        sink.append(source);
         self.sink = Some(sink);
         self.stream = Some(stream);
         self.current = Some(queue_position);
@@ -3107,21 +3332,31 @@ impl PlayerApp {
         let position = position.min(duration);
         let was_paused = self.sink.as_ref().is_some_and(Sink::is_paused);
 
-        let file = match File::open(&path) {
-            Ok(file) => file,
-            Err(error) => {
-                self.status = format!("Could not reopen {} to seek: {error}", path.display());
-                return;
+        let is_opus = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("opus"));
+        let mut decoder = if is_opus {
+            None
+        } else {
+            let file = match File::open(&path) {
+                Ok(file) => file,
+                Err(error) => {
+                    self.status = format!("Could not reopen {} to seek: {error}", path.display());
+                    return;
+                }
+            };
+            match Decoder::new(BufReader::new(file)) {
+                Ok(decoder) => Some(decoder),
+                Err(error) => {
+                    self.status = format!("Could not decode {} to seek: {error}", path.display());
+                    return;
+                }
             }
         };
-        let mut decoder = match Decoder::new(BufReader::new(file)) {
-            Ok(decoder) => decoder,
-            Err(error) => {
-                self.status = format!("Could not decode {} to seek: {error}", path.display());
-                return;
-            }
-        };
-        let decoder_seeks = decoder.try_seek(position).is_ok();
+        let decoder_seeks = decoder
+            .as_mut()
+            .is_some_and(|decoder| decoder.try_seek(position).is_ok());
 
         let (stream, handle) = match OutputStream::try_default() {
             Ok(output) => output,
@@ -3139,7 +3374,15 @@ impl PlayerApp {
         };
         sink.set_volume(self.volume);
         if decoder_seeks {
-            sink.append(decoder);
+            sink.append(decoder.expect("decoder exists when native seek succeeded"));
+        } else if is_opus {
+            match open_audio_source(&path) {
+                Ok(source) => sink.append(source.skip_duration(position)),
+                Err(error) => {
+                    self.status = format!("Could not decode {} to seek: {error}", path.display());
+                    return;
+                }
+            }
         } else {
             let file = match File::open(&path) {
                 Ok(file) => file,
@@ -8217,6 +8460,7 @@ impl PlayerApp {
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let window_focused = ctx.input(|input| input.focused);
+        self.poll_update_messages();
         self.load_ui_icons(ctx);
         #[cfg(target_os = "windows")]
         self.initialize_media_controls(frame, ctx);
@@ -8225,9 +8469,11 @@ impl eframe::App for PlayerApp {
             self.poll_home_job();
             self.poll_duplicate_scan();
             self.poll_artwork(ctx);
-            self.poll_media_key_commands();
             self.poll_ai_mix();
         }
+        // Windows media-key events arrive through the system media session and
+        // must be serviced even while Lilt is in the background.
+        self.poll_media_key_commands();
         self.capture_status_output(ctx);
         if !self.artwork_pending.is_empty() {
             if window_focused {
@@ -8240,9 +8486,7 @@ impl eframe::App for PlayerApp {
             self.next_track();
         }
         #[cfg(target_os = "windows")]
-        if window_focused {
-            self.update_media_session();
-        }
+        self.update_media_session();
         let can_use_shortcuts = !ctx.wants_keyboard_input();
         let shortcuts = ctx.input(|input| {
             (
@@ -9701,6 +9945,85 @@ impl eframe::App for PlayerApp {
         }
 
         self.show_properties_window(ctx);
+
+        if self.default_app_prompt_open {
+            let mut open_settings = false;
+            let mut not_now = false;
+            egui::Window::new("Make Lilt your default music player?")
+                .id(egui::Id::new("lilt-default-app-prompt"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Lilt can play MP3, FLAC, WAV, M4A, OGG, OPUS, and AAC files.");
+                    ui.label("Windows requires you to choose your default apps in Settings.");
+                    ui.horizontal(|ui| {
+                        open_settings = ui.button("Choose Lilt in Windows Settings").clicked();
+                        not_now = ui.button("Not now").clicked();
+                    });
+                });
+            if open_settings {
+                self.default_app_prompt_open = false;
+                self.save_state();
+                match open_default_apps_settings() {
+                    Ok(()) => {
+                        self.update_notice = Some(
+                            "In Windows Settings, choose Lilt as the default app for the music formats you want it to open.".into(),
+                        );
+                    }
+                    Err(error) => self.update_notice = Some(error),
+                }
+            } else if not_now {
+                self.default_app_prompt_open = false;
+                self.save_state();
+            }
+        }
+
+        if let Some(update) = self.update_available.clone() {
+            let mut later = false;
+            let mut update_now = false;
+            egui::Window::new("Lilt update available")
+                .id(egui::Id::new("lilt-update-available"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(RichText::new(format!("Lilt {} is ready to download.", update.version)).strong());
+                    ui.label("If you choose Update now, Lilt will download the MSI and open it. Windows will ask you to confirm installation.");
+                    if self.update_downloading {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Downloading the installer…");
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        update_now = ui
+                            .add_enabled(!self.update_downloading, egui::Button::new("Update now"))
+                            .clicked();
+                        later = ui.add_enabled(!self.update_downloading, egui::Button::new("Later")).clicked();
+                    });
+                });
+            if update_now {
+                self.download_update();
+            } else if later {
+                self.update_available = None;
+            }
+        }
+        if let Some(notice) = self.update_notice.clone() {
+            let mut dismiss = false;
+            egui::Window::new("Lilt updater")
+                .id(egui::Id::new("lilt-update-notice"))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label(notice);
+                    dismiss = ui.button("OK").clicked();
+                });
+            if dismiss {
+                self.update_notice = None;
+            }
+        }
 
         if let Some((path, title)) = self.pending_delete.clone() {
             let mut confirm = false;
@@ -11318,6 +11641,236 @@ fn wide_null(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+fn version_parts(version: &str) -> Vec<u64> {
+    version
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+fn is_newer_version(candidate: &str, current: &str) -> bool {
+    let candidate = version_parts(candidate);
+    let current = version_parts(current);
+    let width = candidate.len().max(current.len());
+    (0..width)
+        .map(|index| candidate.get(index).copied().unwrap_or(0))
+        .cmp((0..width).map(|index| current.get(index).copied().unwrap_or(0)))
+        .is_gt()
+}
+
+#[cfg(windows)]
+fn check_for_update() -> Result<Option<UpdateInfo>, String> {
+    let response = winhttp_get(
+        "api.github.com",
+        "/repos/ultimatebloxstudium-tech/Lilt/releases/latest",
+        "application/vnd.github+json",
+        1024 * 1024,
+    )?;
+    let release: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|_| "GitHub returned an invalid release response.".to_string())?;
+    let tag = release["tag_name"]
+        .as_str()
+        .ok_or_else(|| "GitHub release did not include a version tag.".to_string())?;
+    let current = env!("CARGO_PKG_VERSION");
+    if !is_newer_version(tag, current) {
+        return Ok(None);
+    }
+    let asset_url = release["assets"]
+        .as_array()
+        .and_then(|assets| {
+            assets.iter().find_map(|asset| {
+                let name = asset["name"].as_str()?;
+                let url = asset["browser_download_url"].as_str()?;
+                (name.to_ascii_lowercase().ends_with("windows-x64.msi")
+                    || (name.to_ascii_lowercase().ends_with(".msi")
+                        && name.to_ascii_lowercase().contains("x64")))
+                .then(|| url.to_string())
+            })
+        })
+        .ok_or_else(|| {
+            "A newer Lilt release exists, but its Windows MSI was not found.".to_string()
+        })?;
+    Ok(Some(UpdateInfo {
+        version: tag.trim_start_matches(['v', 'V']).to_string(),
+        download_url: asset_url,
+    }))
+}
+
+#[cfg(not(windows))]
+fn check_for_update() -> Result<Option<UpdateInfo>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn open_default_apps_settings() -> Result<(), String> {
+    std::process::Command::new("explorer.exe")
+        .arg("ms-settings:defaultapps?registeredAppUser=Lilt")
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("Could not open Windows Default Apps settings: {error}"))
+}
+
+#[cfg(not(windows))]
+fn open_default_apps_settings() -> Result<(), String> {
+    Err("Windows Default Apps settings are available only on Windows.".into())
+}
+
+#[cfg(windows)]
+fn download_and_open_update(update: &UpdateInfo) -> Result<(), String> {
+    let url = update
+        .download_url
+        .strip_prefix("https://")
+        .ok_or_else(|| "The release download URL is not secure.".to_string())?;
+    let (host, path) = url
+        .split_once('/')
+        .ok_or_else(|| "The release download URL is invalid.".to_string())?;
+    let bytes = winhttp_get(
+        host,
+        &format!("/{path}"),
+        "application/octet-stream",
+        512 * 1024 * 1024,
+    )?;
+    if bytes.len() < 8 || !bytes.starts_with(b"\xD0\xCF\x11\xE0\xA1\xB1\x1A\xE1") {
+        return Err("GitHub did not return a valid MSI installer.".into());
+    }
+    let installer = std::env::temp_dir().join(format!("Lilt-v{}-windows-x64.msi", update.version));
+    fs::write(&installer, bytes)
+        .map_err(|error| format!("Could not save the downloaded installer: {error}"))?;
+    std::process::Command::new("msiexec.exe")
+        .arg("/i")
+        .arg(&installer)
+        .spawn()
+        .map_err(|error| {
+            format!("Downloaded the installer, but could not open Windows Installer: {error}")
+        })?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn download_and_open_update(_: &UpdateInfo) -> Result<(), String> {
+    Err("The MSI updater is available only on Windows.".into())
+}
+
+#[cfg(windows)]
+fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::Networking::WinHttp::*;
+    unsafe {
+        let agent = wide_null("Lilt Player");
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err("Could not start the secure update connection.".into());
+        }
+        WinHttpSetTimeouts(session, 10_000, 10_000, 20_000, 60_000);
+        let host_w = wide_null(host);
+        let connection = WinHttpConnect(session, host_w.as_ptr(), 443, 0);
+        if connection.is_null() {
+            WinHttpCloseHandle(session);
+            return Err("Could not connect to GitHub.".into());
+        }
+        let path_w = wide_null(path);
+        let get = wide_null("GET");
+        let request = WinHttpOpenRequest(
+            connection,
+            get.as_ptr(),
+            path_w.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        );
+        if request.is_null() {
+            WinHttpCloseHandle(connection);
+            WinHttpCloseHandle(session);
+            return Err("Could not prepare the GitHub request.".into());
+        }
+        let headers = wide_null(&format!(
+            "Accept: {accept}\r\nUser-Agent: Lilt Player\r\nX-GitHub-Api-Version: 2022-11-28\r\n"
+        ));
+        let ok = WinHttpSendRequest(
+            request,
+            headers.as_ptr(),
+            (headers.len() - 1) as u32,
+            ptr::null(),
+            0,
+            0,
+            0,
+        ) != 0
+            && WinHttpReceiveResponse(request, ptr::null_mut()) != 0;
+        let mut result = Ok(Vec::new());
+        if !ok {
+            result = Err("GitHub update request failed; check your internet connection.".into());
+        } else {
+            let mut status = 0u32;
+            let mut status_size = std::mem::size_of::<u32>() as u32;
+            WinHttpQueryHeaders(
+                request,
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                ptr::null(),
+                (&mut status as *mut u32).cast(),
+                &mut status_size,
+                ptr::null_mut(),
+            );
+            if status != 200 {
+                result = Err(format!(
+                    "GitHub returned HTTP {status} while checking or downloading the update."
+                ));
+            } else {
+                let mut body = Vec::new();
+                loop {
+                    let mut available = 0;
+                    if WinHttpQueryDataAvailable(request, &mut available) == 0 {
+                        result = Err("The update download was interrupted.".into());
+                        break;
+                    }
+                    if available == 0 {
+                        break;
+                    }
+                    let start = body.len();
+                    let take = (available as usize).min(64 * 1024);
+                    if start.saturating_add(take) > max_bytes {
+                        result = Err("The update download is larger than expected.".into());
+                        break;
+                    }
+                    body.resize(start + take, 0);
+                    let mut read = 0u32;
+                    if WinHttpReadData(
+                        request,
+                        body[start..].as_mut_ptr().cast::<c_void>(),
+                        take as u32,
+                        &mut read,
+                    ) == 0
+                    {
+                        result = Err("The update download was interrupted.".into());
+                        break;
+                    }
+                    body.truncate(start + read as usize);
+                }
+                if result.is_ok() {
+                    result = Ok(body);
+                }
+            }
+        }
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        result
+    }
+}
+
 #[cfg(windows)]
 fn google_ai_post(key: &str, body: &str, model: GeminiModel) -> Result<String, String> {
     use std::{ffi::c_void, ptr};
@@ -11472,35 +12025,106 @@ fn seek_position_from_pointer(
 fn preferences_path() -> Result<PathBuf, String> {
     let project = ProjectDirs::from("com", "Lilt", "Lilt Player")
         .ok_or_else(|| "Could not locate the user configuration directory.".to_string())?;
-    fs::create_dir_all(project.config_dir())
-        .map_err(|error| format!("Could not create settings directory: {error}"))?;
     Ok(project.config_dir().join("settings.json"))
 }
 
-fn load_preferences() -> Result<Preferences, String> {
-    let path = preferences_path()?;
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(Preferences::default());
+fn fallback_preferences_path() -> Result<PathBuf, String> {
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            return Ok(directory
+                .join("LiltPlayerData")
+                .join("config")
+                .join("settings.json"));
         }
-        Err(error) => {
-            return Err(format!(
-                "Could not read settings at {}: {error}",
-                path.display()
-            ));
-        }
-    };
+    }
+    Ok(std::env::temp_dir()
+        .join("LiltPlayerData")
+        .join("config")
+        .join("settings.json"))
+}
+
+fn read_preferences_file(path: &Path) -> Result<Preferences, String> {
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Could not read settings at {}: {error}", path.display()))?;
     serde_json::from_slice(&bytes)
         .map_err(|error| format!("Could not parse settings at {}: {error}", path.display()))
 }
 
+fn load_preferences() -> Result<Preferences, String> {
+    let mut candidates = [preferences_path()?, fallback_preferences_path()?]
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|path| {
+        fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(UNIX_EPOCH)
+    });
+    if candidates.is_empty() {
+        return Ok(Preferences::default());
+    }
+    let mut last_error = None;
+    for path in candidates.into_iter().rev() {
+        match read_preferences_file(&path) {
+            Ok(preferences) => return Ok(preferences),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| "Could not read the settings file.".into()))
+}
+
 fn save_preferences(preferences: &Preferences) -> Result<(), String> {
-    let path = preferences_path()?;
     let bytes = serde_json::to_vec_pretty(&preferences)
         .map_err(|error| format!("Could not encode settings: {error}"))?;
-    fs::write(&path, bytes)
-        .map_err(|error| format!("Could not save settings at {}: {error}", path.display()))
+    let primary = preferences_path()?;
+    match write_settings_atomically(&primary, &bytes) {
+        Ok(()) => Ok(()),
+        Err(primary_error) => {
+            let fallback = fallback_preferences_path()?;
+            if fallback == primary {
+                return Err(format!(
+                    "Could not save settings at {}: {primary_error}",
+                    primary.display()
+                ));
+            }
+            write_settings_atomically(&fallback, &bytes).map_err(|fallback_error| {
+                format!(
+                    "Could not save settings at {} ({primary_error}) or fallback {} ({fallback_error}).",
+                    primary.display(),
+                    fallback.display()
+                )
+            })
+        }
+    }
+}
+
+fn write_settings_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "settings path has no parent",
+        )
+    })?;
+    fs::create_dir_all(parent)?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temporary = parent.join(format!(".settings-{}-{nonce}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    match fs::rename(&temporary, path) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            let _ = fs::remove_file(&temporary);
+            Err(rename_error)
+        }
+    }
 }
 
 fn view_mode_name(mode: ViewMode) -> &'static str {
@@ -11674,6 +12298,24 @@ fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
 }
 
 fn main() -> eframe::Result<()> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    let mut startup_folder = None;
+    let mut startup_file = None;
+    let mut argument_index = 0;
+    while argument_index < arguments.len() {
+        if arguments[argument_index] == "--folder" {
+            if let Some(folder) = arguments.get(argument_index + 1) {
+                startup_folder = Some(PathBuf::from(folder));
+                argument_index += 1;
+            }
+        } else if startup_file.is_none() {
+            let path = PathBuf::from(&arguments[argument_index]);
+            if path.is_file() {
+                startup_file = Some(path);
+            }
+        }
+        argument_index += 1;
+    }
     let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app_icon.png"))
         .unwrap_or_default();
     let start_maximized = load_preferences()
@@ -11692,7 +12334,12 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         APP_NAME,
         options,
-        Box::new(|_creation_context| Ok(Box::new(PlayerApp::new()))),
+        Box::new(move |_creation_context| {
+            Ok(Box::new(PlayerApp::new_with_folder(
+                startup_folder,
+                startup_file,
+            )))
+        }),
     )
 }
 

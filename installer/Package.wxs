@@ -1,15 +1,17 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Lilt" Manufacturer="UltimateBloxStudium"
-           Version="0.2.12" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
+           Version="0.2.13" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
            Scope="perUser" InstallerVersion="500">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lilt is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="LiltIcon" SourceFile="assets/app_icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="LiltIcon" />
-    <ui:WixUI Id="WixUI_FeatureTree" />
+    <ui:WixUI Id="WixUI_Minimal" />
     <Feature Id="MainFeature" Title="Lilt" Level="1">
       <ComponentGroupRef Id="LiltFiles" />
+      <ComponentRef Id="LiltExplorerBackground" />
+      <ComponentRef Id="LiltFileAssociations" />
     </Feature>
     <Feature Id="StartMenuShortcutFeature" Title="Start Menu shortcut" Description="Add Lilt to the Start Menu." Level="1">
       <ComponentRef Id="StartMenuShortcutComponent" />
@@ -24,17 +26,58 @@
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Lilt">
           <Component Id="LiltExecutable" Guid="*">
-            <File Id="LiltExe" Source="dist/Lilt-v0.2.12-windows-x64/lilt-player.exe" KeyPath="yes" />
+            <File Id="LiltExe" Source="dist/Lilt-v0.2.13-windows-x64/lilt-player.exe" KeyPath="yes" />
             <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="Installed" Type="integer" Value="1" />
           </Component>
           <Component Id="LiltPngIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.12-windows-x64/app_icon.png" />
+            <File Source="dist/Lilt-v0.2.13-windows-x64/app_icon.png" />
           </Component>
           <Component Id="LiltIcoIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.12-windows-x64/app_icon.ico" />
+            <File Source="dist/Lilt-v0.2.13-windows-x64/app_icon.ico" />
           </Component>
           <Component Id="LiltReadme" Guid="*">
-            <File Source="dist/Lilt-v0.2.12-windows-x64/README.md" />
+            <File Source="dist/Lilt-v0.2.13-windows-x64/README.md" />
+          </Component>
+          <Component Id="LiltExplorerBackground" Guid="*">
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer">
+              <RegistryValue Type="string" Value="Open folder with Lilt" />
+              <RegistryValue Name="Icon" Type="string" Value="[#LiltExe]" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer\command">
+              <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; --folder &quot;%V&quot;" KeyPath="yes" />
+            </RegistryKey>
+          </Component>
+          <Component Id="LiltFileAssociations" Guid="*">
+            <RegistryKey Root="HKCU" Key="Software\RegisteredApplications">
+              <RegistryValue Name="Lilt" Type="string" Value="Software\UltimateBloxStudium\Lilt\Capabilities" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\UltimateBloxStudium\Lilt\Capabilities">
+              <RegistryValue Name="ApplicationName" Type="string" Value="Lilt" />
+              <RegistryValue Name="ApplicationDescription" Type="string" Value="Lilt music player" />
+              <RegistryValue Name="ApplicationIcon" Type="string" Value="[#LiltExe],0" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\UltimateBloxStudium\Lilt\Capabilities\FileAssociations">
+              <RegistryValue Name=".mp3" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".flac" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".wav" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".m4a" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".ogg" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".opus" Type="string" Value="Lilt.Audio" />
+              <RegistryValue Name=".aac" Type="string" Value="Lilt.Audio" />
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Lilt.Audio">
+              <RegistryValue Type="string" Value="Lilt Music File" />
+              <RegistryKey Key="DefaultIcon">
+                <RegistryValue Type="string" Value="[#LiltExe],0" />
+              </RegistryKey>
+              <RegistryKey Key="shell">
+                <RegistryKey Key="open">
+                  <RegistryKey Key="command">
+                    <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; &quot;%1&quot;" KeyPath="yes" />
+                  </RegistryKey>
+                </RegistryKey>
+              </RegistryKey>
+            </RegistryKey>
           </Component>
         </Directory>
       </Directory>

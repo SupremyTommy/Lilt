@@ -7,9 +7,11 @@ Native Windows desktop player. It does not need Python or a Python runtime.
 ## Build
 
 Install the stable Rust toolchain with the MSVC target and run `build-release.bat`.
-The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.12-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.12-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
+The release script builds `target\release\lilt-player.exe`, a portable ZIP, and a per-user installer. Publish the MSI as the sole GitHub release asset; the executable and ZIP remain local build artifacts. The MSI installs Start Menu and Desktop shortcuts, registers Lilt as a selectable player for supported audio formats, and adds “Open folder with Lilt” to File Explorer's folder-background context menu. Windows still controls which app becomes the default. The Explorer integration is registered by the MSI and does not require Lilt to run at Windows log in.
 
-The release script installs WiX Toolset 7 locally if needed. On a fresh setup, read and accept its EULA once by following the [WiX EULA instructions](https://docs.firegiant.com/wix/osmf/) before building the MSI.
+Lilt checks GitHub for a newer published version quietly at startup. If one is available, it asks before downloading and opening the MSI installer. The user completes or cancels the Windows Installer prompts.
+
+The release script installs WiX Toolset 7 locally if needed. WiX may ask the developer to accept its tool license on first setup; the Lilt MSI itself has no end-user license screen.
 
 ## Current features
 
