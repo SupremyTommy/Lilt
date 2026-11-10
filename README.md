@@ -7,7 +7,7 @@ Native Windows desktop player. It does not need Python or a Python runtime.
 ## Build
 
 Install the stable Rust toolchain with the MSVC target and run `build-release.bat`.
-The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.7-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.7-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
+The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.8-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.8-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
 
 The release script installs WiX Toolset 7 locally if needed. On a fresh setup, read and accept its EULA once by following the [WiX EULA instructions](https://docs.firegiant.com/wix/osmf/) before building the MSI.
 
@@ -31,7 +31,8 @@ The release script installs WiX Toolset 7 locally if needed. On a fresh setup, r
 - Mix Studio can use an optional Google AI Studio key stored in Windows Credential Manager to
   create short mood mixes or refresh recommendations on request from a limited set of song labels;
   AI-assisted recommendations are off by default, and no paths or audio are sent
-- Mix Studio includes in-page model, thinking, mix-size, and opt-in recommendation controls, plus
+- Mix Studio includes saved Liked, Played, and Unplayed library filters, full-library compact metadata,
+  in-page model, thinking, mix-size, and opt-in recommendation controls, plus
   per-request and total token usage reported by Google; account quota links to Google AI Studio
 - Developer Output panel and temporary error notifications for app status and troubleshooting
 - Right-click track, album, artist, Home mix, or playlist items for playback, queueing, library,

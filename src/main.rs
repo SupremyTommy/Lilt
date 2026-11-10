@@ -203,6 +203,12 @@ struct Preferences {
     google_ai_thinking: GeminiThinking,
     #[serde(default = "default_ai_mix_size")]
     ai_mix_size: usize,
+    #[serde(default = "default_true")]
+    ai_mix_include_liked: bool,
+    #[serde(default = "default_true")]
+    ai_mix_include_played: bool,
+    #[serde(default = "default_true")]
+    ai_mix_include_unplayed: bool,
     #[serde(default)]
     google_ai_usage: AiUsage,
     #[serde(default)]
@@ -266,6 +272,9 @@ impl Default for Preferences {
             google_ai_model: GeminiModel::default(),
             google_ai_thinking: GeminiThinking::default(),
             ai_mix_size: default_ai_mix_size(),
+            ai_mix_include_liked: true,
+            ai_mix_include_played: true,
+            ai_mix_include_unplayed: true,
             google_ai_usage: AiUsage::default(),
             google_ai_requests: 0,
             google_ai_last_usage: None,
@@ -306,6 +315,10 @@ fn default_recommendation_size() -> usize {
 
 fn default_ai_mix_size() -> usize {
     12
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_ui_scale() -> f32 {
@@ -562,6 +575,9 @@ struct PlayerApp {
     google_ai_model: GeminiModel,
     google_ai_thinking: GeminiThinking,
     ai_mix_size: usize,
+    ai_mix_include_liked: bool,
+    ai_mix_include_played: bool,
+    ai_mix_include_unplayed: bool,
     google_ai_usage: AiUsage,
     google_ai_requests: u64,
     google_ai_last_usage: Option<AiUsage>,
@@ -703,6 +719,9 @@ impl PlayerApp {
             google_ai_model: preferences.google_ai_model,
             google_ai_thinking: preferences.google_ai_thinking,
             ai_mix_size: preferences.ai_mix_size.clamp(4, 20),
+            ai_mix_include_liked: preferences.ai_mix_include_liked,
+            ai_mix_include_played: preferences.ai_mix_include_played,
+            ai_mix_include_unplayed: preferences.ai_mix_include_unplayed,
             google_ai_usage: preferences.google_ai_usage,
             google_ai_requests: preferences.google_ai_requests,
             google_ai_last_usage: preferences.google_ai_last_usage,
@@ -2683,6 +2702,9 @@ impl PlayerApp {
             google_ai_model: self.google_ai_model,
             google_ai_thinking: self.google_ai_thinking,
             ai_mix_size: self.ai_mix_size,
+            ai_mix_include_liked: self.ai_mix_include_liked,
+            ai_mix_include_played: self.ai_mix_include_played,
+            ai_mix_include_unplayed: self.ai_mix_include_unplayed,
             google_ai_usage: self.google_ai_usage,
             google_ai_requests: self.google_ai_requests,
             google_ai_last_usage: self.google_ai_last_usage,
@@ -3997,7 +4019,6 @@ impl PlayerApp {
             }
         }
 
-        ui.heading(RichText::new("Smart mixes").size(28.0).strong());
         ui.label(
             RichText::new(
                 "Local recommendations that adapt to your likes, plays, and music metadata.",
@@ -4122,45 +4143,68 @@ impl PlayerApp {
                     ui.heading("Mix Studio");
                     ui.label(RichText::new("Optional · Google AI").small().color(Color32::GRAY));
                 });
-        ui.label(RichText::new("Describe a mood or moment. Lilt sends a short prompt and up to 48 song labels with liked, played, or new tags to make a mix.").small().color(Color32::GRAY));
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Model");
-                    let model_changed = egui::ComboBox::from_id_salt("mix-studio-model")
-                        .selected_text(self.google_ai_model.label())
-                        .show_ui(ui, |ui| {
-                            let mut changed = false;
-                            changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::FlashLite, GeminiModel::FlashLite.label()).changed();
-                            changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::Flash, GeminiModel::Flash.label()).changed();
-                            changed
-                        }).inner.unwrap_or(false);
-                    if model_changed { self.save_state(); }
-                    ui.label("Thinking");
-                    let thinking_changed = egui::ComboBox::from_id_salt("mix-studio-thinking")
-                        .selected_text(match self.google_ai_thinking { GeminiThinking::Minimal => "Minimal · lowest usage", GeminiThinking::Low => "Low · more planning" })
-                        .show_ui(ui, |ui| {
-                            let mut changed = false;
-                            changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Minimal, "Minimal · lowest usage").changed();
-                            changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Low, "Low · more planning").changed();
-                            changed
-                        }).inner.unwrap_or(false);
-                    if thinking_changed { self.save_state(); }
-                    ui.label("Tracks");
-                    let size_changed = egui::ComboBox::from_id_salt("mix-studio-size")
-                        .selected_text(self.ai_mix_size.to_string())
-                        .show_ui(ui, |ui| {
-                            let mut changed = false;
-                            for size in [8, 12, 16, 20] {
-                                changed |= ui.selectable_value(&mut self.ai_mix_size, size, size.to_string()).changed();
+                ui.label(RichText::new("Describe a mood, artist, or genre. Lilt sends compact title, artist, genre, and familiarity labels for available tracks so the mix can draw from your full library.").small().color(Color32::GRAY));
+                egui::CollapsingHeader::new("Mix options")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        ui.label(RichText::new("Choose what can appear in an AI mix").strong());
+                        ui.horizontal_wrapped(|ui| {
+                            let all_music = self.ai_mix_include_liked
+                                && self.ai_mix_include_played
+                                && self.ai_mix_include_unplayed;
+                            if ui.selectable_label(all_music, "All music").clicked() && !all_music {
+                                self.ai_mix_include_liked = true;
+                                self.ai_mix_include_played = true;
+                                self.ai_mix_include_unplayed = true;
+                                self.save_state();
                             }
-                            changed
-                        }).inner.unwrap_or(false);
-                    if size_changed { self.save_state(); }
-                });
+                            let mut changed = false;
+                            changed |= ui.checkbox(&mut self.ai_mix_include_liked, "Liked music").changed();
+                            changed |= ui.checkbox(&mut self.ai_mix_include_played, "Played music").changed();
+                            changed |= ui.checkbox(&mut self.ai_mix_include_unplayed, "Unplayed music").changed();
+                            if changed { self.save_state(); }
+                        });
+                        ui.label(RichText::new("Disliked and excluded tracks are always left out.").small().color(Color32::GRAY));
+                        ui.separator();
+                        ui.horizontal_wrapped(|ui| {
+                            ui.label("Model");
+                            let model_changed = egui::ComboBox::from_id_salt("mix-studio-model")
+                                .selected_text(self.google_ai_model.label())
+                                .show_ui(ui, |ui| {
+                                    let mut changed = false;
+                                    changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::FlashLite, GeminiModel::FlashLite.label()).changed();
+                                    changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::Flash, GeminiModel::Flash.label()).changed();
+                                    changed
+                                }).inner.unwrap_or(false);
+                            if model_changed { self.save_state(); }
+                            ui.label("Thinking");
+                            let thinking_changed = egui::ComboBox::from_id_salt("mix-studio-thinking")
+                                .selected_text(match self.google_ai_thinking { GeminiThinking::Minimal => "Minimal · lowest usage", GeminiThinking::Low => "Low · more planning" })
+                                .show_ui(ui, |ui| {
+                                    let mut changed = false;
+                                    changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Minimal, "Minimal · lowest usage").changed();
+                                    changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Low, "Low · more planning").changed();
+                                    changed
+                                }).inner.unwrap_or(false);
+                            if thinking_changed { self.save_state(); }
+                            ui.label("Tracks");
+                            let size_changed = egui::ComboBox::from_id_salt("mix-studio-size")
+                                .selected_text(self.ai_mix_size.to_string())
+                                .show_ui(ui, |ui| {
+                                    let mut changed = false;
+                                    for size in [8, 12, 16, 20] {
+                                        changed |= ui.selectable_value(&mut self.ai_mix_size, size, size.to_string()).changed();
+                                    }
+                                    changed
+                                }).inner.unwrap_or(false);
+                            if size_changed { self.save_state(); }
+                        });
+                    });
                 if ui.checkbox(&mut self.ai_recommendations_enabled, "Use AI when I refresh For you recommendations (off by default)").changed() {
                     if !self.ai_recommendations_enabled { self.ai_recommendation_indices.clear(); }
                     self.save_state();
                 }
-                ui.label(RichText::new("AI recommendation refresh runs only when clicked. Google receives at most 48 short song labels and liked/played/new tags; no paths or audio.").small().color(Color32::GRAY));
+                ui.label(RichText::new("AI runs only when clicked. Google receives compact title, artist, genre, and liked/played/new labels for available tracks; no paths or audio. Full-library requests use more tokens.").small().color(Color32::GRAY));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.ai_mix_prompt).desired_width(ui.available_width() - 130.0).hint_text("e.g. energetic electronic for a night drive"));
                     if ui.add_enabled(!self.ai_mix_pending, egui::Button::new(if self.ai_mix_pending { "Making…" } else { "Create mix" })).clicked() {
@@ -4174,8 +4218,11 @@ impl PlayerApp {
                     });
                 }
                 if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
+                egui::CollapsingHeader::new("Google AI usage")
+                    .default_open(false)
+                    .show(ui, |ui| {
                 ui.separator();
-                ui.label(RichText::new("Google AI usage reported to Lilt").strong());
+                ui.label(RichText::new("Usage reported to Lilt").strong());
                 if let Some(usage) = self.google_ai_last_usage {
                     ui.label(format!("Last request · input {} · output {} · thinking {} · total {} tokens", usage.prompt_tokens, usage.output_tokens, usage.thinking_tokens, usage.total_tokens));
                 } else {
@@ -4186,6 +4233,7 @@ impl PlayerApp {
                     ui.label(RichText::new("Google does not return remaining project quota to this app.").small().color(Color32::GRAY));
                     ui.hyperlink_to("View Google AI usage and limits", "https://aistudio.google.com/usage");
                 });
+                    });
                 if !self.ai_mix_results.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} picks", self.ai_mix_results.len()));
@@ -4193,7 +4241,7 @@ impl PlayerApp {
                         if ui.button("Add to queue").clicked() { self.add_tracks_to_queue(&self.ai_mix_results.clone()); }
                         if ui.button("Save as playlist").clicked() { self.store_ai_mix_as_playlist(); }
                     });
-                    egui::ScrollArea::horizontal().id_salt("mix-studio-picks").max_height(88.0).show(ui, |ui| {
+                    egui::ScrollArea::vertical().id_salt("mix-studio-picks").max_height(180.0).show(ui, |ui| {
                         for &index in self.ai_mix_results.clone().iter().take(24) {
                             if let Some(track) = self.tracks.get(index) {
                                 ui.label(RichText::new(format!("{} · {}", track.title, display_credit(&track.artist))).small());
@@ -4331,10 +4379,14 @@ impl PlayerApp {
                 }
                 ui.heading(RichText::new(&title).size(28.0).strong());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.show_view_mode_selector(ui);
+                    if !matches!(
+                        self.page,
+                        Page::Settings | Page::Mixes | Page::Stats | Page::Lyrics | Page::Discover
+                    ) {
+                        self.show_view_mode_selector(ui);
+                    }
                     if self.page == Page::History && ui.small_button("Clear history").clicked() {
                         self.history.clear();
-                        self.home_cache_dirty = true;
                         self.home_cache_dirty = true;
                         self.save_state();
                     }
@@ -4396,7 +4448,12 @@ impl PlayerApp {
                     .show(ui, |ui| self.show_home(ui));
             }
             Page::Discover => self.show_discover(ui),
-            Page::Mixes => self.show_smart_mixes(ui),
+            Page::Mixes => {
+                egui::ScrollArea::vertical()
+                    .id_salt("smart-mixes-page")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.show_smart_mixes(ui));
+            }
             Page::Stats => self.show_listening_stats(ui),
             Page::Songs | Page::LikedSongs | Page::History | Page::Disliked => {
                 if self.page == Page::Songs {
@@ -7663,12 +7720,16 @@ impl PlayerApp {
         } else {
             self.ai_mix_prompt.chars().take(120).collect::<String>()
         };
-        let mut indices = self.recommendation_indices();
-        indices.extend(0..self.tracks.len());
-        let mut seen = HashSet::new();
-        let candidates = indices
-            .into_iter()
-            .filter(|index| seen.insert(*index))
+        if !self.ai_mix_include_liked
+            && !self.ai_mix_include_played
+            && !self.ai_mix_include_unplayed
+        {
+            self.ai_mix_status = "Choose at least one music group in Mix options.".into();
+            return;
+        }
+        // Include the whole available local catalog. The old 48-track cap meant
+        // large libraries only exposed their first recommendation cluster.
+        let candidates = (0..self.tracks.len())
             .filter_map(|index| {
                 let track = self.tracks.get(index)?;
                 if self.excluded_tracks.contains(&track.path)
@@ -7676,21 +7737,28 @@ impl PlayerApp {
                 {
                     return None;
                 }
+                let liked = self.liked_songs.contains(&track.path);
+                let played = self.history.contains(&track.path);
+                let included = (liked && self.ai_mix_include_liked)
+                    || (played && self.ai_mix_include_played)
+                    || (!liked && !played && self.ai_mix_include_unplayed);
+                if !included {
+                    return None;
+                }
                 Some(AiMixCandidate {
                     index,
-                    title: compact_metadata(&track.title, 42),
-                    artist: compact_metadata(&display_credit(&track.artist), 28),
-                    genre: compact_metadata(&track.genre, 20),
-                    familiarity: if self.liked_songs.contains(&track.path) {
-                        "liked"
-                    } else if self.history.contains(&track.path) {
-                        "played"
+                    title: compact_metadata(&track.title, 64),
+                    artist: compact_metadata(&display_credit(&track.artist), 48),
+                    genre: compact_metadata(&track.genre, 32),
+                    familiarity: if liked {
+                        "L"
+                    } else if played {
+                        "P"
                     } else {
-                        "new"
+                        "N"
                     },
                 })
             })
-            .take(48)
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             self.ai_mix_status = "Add a few songs to your library first.".into();
@@ -7698,7 +7766,10 @@ impl PlayerApp {
         }
 
         self.ai_mix_pending = true;
-        self.ai_mix_status = format!("Making a mix from {} short track labels…", candidates.len());
+        self.ai_mix_status = format!(
+            "Making a mix from all {} available tracks…",
+            candidates.len()
+        );
         let sender = self.ai_mix_sender.clone();
         let repaint = context.clone();
         let model = self.google_ai_model;
@@ -7915,6 +7986,10 @@ impl PlayerApp {
             (
                 "discover",
                 include_bytes!("../assets/icons/ic-equalizer-24px.svg"),
+            ),
+            (
+                "smart_mixes",
+                include_bytes!("../assets/icons/ic-smart-mixes-24px.svg"),
             ),
         ];
         for (name, bytes) in ICONS {
@@ -8377,7 +8452,7 @@ impl eframe::App for PlayerApp {
                                 vec![
                                     (Page::Home, "Home", "home"),
                                     (Page::Discover, "Discover", "discover"),
-                                    (Page::Mixes, "Smart mixes", "equalizer"),
+                                    (Page::Mixes, "Smart mixes", "smart_mixes"),
                                     (Page::Songs, "Songs", "songs"),
                                     (Page::Albums, "Albums", "album"),
                                     (Page::Artists, "Artists", "person"),
@@ -10753,6 +10828,19 @@ fn compact_metadata(value: &str, limit: usize) -> String {
         .collect()
 }
 
+fn compact_tsv_field(value: &str) -> String {
+    value
+        .chars()
+        .map(|ch| {
+            if matches!(ch, '\t' | '\r' | '\n' | '|') {
+                ' '
+            } else {
+                ch
+            }
+        })
+        .collect()
+}
+
 fn generate_google_ai_mix(
     key: &str,
     theme: &str,
@@ -10761,20 +10849,23 @@ fn generate_google_ai_mix(
     thinking: GeminiThinking,
     mix_size: usize,
 ) -> Result<(Vec<usize>, AiUsage), String> {
-    let entries = candidates
+    let catalog = candidates
         .iter()
         .enumerate()
         .map(|(id, candidate)| {
-            serde_json::json!({
-                "id": id,
-                "title": candidate.title,
-                "artist": candidate.artist,
-                "genre": candidate.genre,
-                "familiarity": candidate.familiarity,
-            })
+            // Compact TSV reduces prompt overhead while retaining every local
+            // song's searchable title, artist, and genre metadata.
+            format!(
+                "{id}\t{}\t{}\t{}\t{}",
+                compact_tsv_field(&candidate.title),
+                compact_tsv_field(&candidate.artist),
+                compact_tsv_field(&candidate.genre),
+                candidate.familiarity
+            )
         })
-        .collect::<Vec<_>>();
-    let prompt = format!("Create a cohesive music mix for this request: {}. Choose up to {} items from the supplied list, balancing familiarity and discovery. Return only a JSON array of integer ids, no explanation. List: {}", compact_metadata(theme, 120), mix_size.clamp(4, 20), serde_json::to_string(&entries).unwrap_or_default());
+        .collect::<Vec<_>>()
+        .join("\n");
+    let prompt = format!("Build a music mix for this request: {}. Select up to {} rows from the complete local catalog below. Match named artists and genres strictly. Never substitute unrelated artists or genres for a specific request; if no tracks match, return []. Otherwise choose a varied cohesive mix, avoiding too many tracks by one artist. Return only a JSON array of row IDs. Catalog columns: id, title, artist, genre, familiarity (L=liked, P=played, N=new).\n{}", compact_metadata(theme, 120), mix_size.clamp(4, 20), catalog);
     let body = serde_json::json!({
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -10863,7 +10954,7 @@ fn generate_google_ai_mix(
         .map(|id| candidates[id].index)
         .collect::<Vec<_>>();
     if indices.is_empty() {
-        Err("Google did not choose any valid songs. Try again.".into())
+        Err("No matching tracks were found in your local library. Try a broader artist, genre, or mood.".into())
     } else {
         Ok((indices, usage))
     }
