@@ -10806,7 +10806,7 @@ fn generate_google_ai_mix(
             .and_then(serde_json::Value::as_u64)
             .unwrap_or(0),
     };
-    if let Some(message) = value.pointer("error.message").and_then(|v| v.as_str()) {
+    if let Some(message) = value.pointer("/error/message").and_then(|v| v.as_str()) {
         return Err(format!(
             "Google AI error: {}",
             compact_metadata(message, 240)
@@ -10817,14 +10817,14 @@ fn generate_google_ai_mix(
         .and_then(serde_json::Value::as_array);
     let Some(candidate) = candidates_response.and_then(|items| items.first()) else {
         let reason = value
-            .pointer("promptFeedback.blockReason")
+            .pointer("/promptFeedback/blockReason")
             .and_then(serde_json::Value::as_str)
             .map(|reason| format!("Google blocked the prompt ({reason}). Try a different description."))
             .unwrap_or_else(|| "Google returned no candidate text. Try a shorter description or check your API key's model access.".to_string());
         return Err(reason);
     };
     let parts = candidate
-        .pointer("content.parts")
+        .pointer("/content/parts")
         .and_then(serde_json::Value::as_array);
     let text = parts
         .into_iter()
@@ -11062,7 +11062,7 @@ fn google_ai_post(key: &str, body: &str, model: GeminiModel) -> Result<String, S
             let message = serde_json::from_str::<serde_json::Value>(&text)
                 .ok()
                 .and_then(|v| {
-                    v.pointer("error.message")
+                    v.pointer("/error/message")
                         .and_then(|m| m.as_str().map(str::to_string))
                 })
                 .unwrap_or_else(|| format!("Google AI returned HTTP {status}."));
