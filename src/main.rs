@@ -81,6 +81,57 @@ enum NowPlayingTab {
     Lyrics,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum GeminiModel {
+    #[default]
+    FlashLite,
+    Flash,
+}
+
+impl GeminiModel {
+    fn id(self) -> &'static str {
+        match self {
+            Self::FlashLite => "gemini-3.5-flash-lite",
+            Self::Flash => "gemini-3.5-flash",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::FlashLite => "Gemini 3.5 Flash-Lite · lowest usage",
+            Self::Flash => "Gemini 3.5 Flash · more capable",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum GeminiThinking {
+    #[default]
+    Minimal,
+    Low,
+}
+
+impl GeminiThinking {
+    fn id(self) -> &'static str {
+        match self {
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+struct AiUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    thinking_tokens: u64,
+    #[serde(default)]
+    total_tokens: u64,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DeletedSongRecord {
     // FNV-1a 128 over the complete file contents. None means the file could not be read
@@ -144,6 +195,20 @@ struct Preferences {
     recommendation_variety: f32,
     #[serde(default = "default_recommendation_size")]
     recommendation_size: usize,
+    #[serde(default)]
+    ai_recommendations_enabled: bool,
+    #[serde(default)]
+    google_ai_model: GeminiModel,
+    #[serde(default)]
+    google_ai_thinking: GeminiThinking,
+    #[serde(default = "default_ai_mix_size")]
+    ai_mix_size: usize,
+    #[serde(default)]
+    google_ai_usage: AiUsage,
+    #[serde(default)]
+    google_ai_requests: u64,
+    #[serde(default)]
+    google_ai_last_usage: Option<AiUsage>,
     #[serde(default = "default_ui_scale")]
     ui_scale: f32,
     #[serde(default = "default_volume")]
@@ -197,6 +262,13 @@ impl Default for Preferences {
             prefer_unplayed: default_prefer_unplayed(),
             recommendation_variety: default_recommendation_variety(),
             recommendation_size: default_recommendation_size(),
+            ai_recommendations_enabled: false,
+            google_ai_model: GeminiModel::default(),
+            google_ai_thinking: GeminiThinking::default(),
+            ai_mix_size: default_ai_mix_size(),
+            google_ai_usage: AiUsage::default(),
+            google_ai_requests: 0,
+            google_ai_last_usage: None,
             ui_scale: default_ui_scale(),
             volume: default_volume(),
             duplicate_scan_enabled: default_duplicate_scan_enabled(),
@@ -230,6 +302,10 @@ fn default_recommendation_variety() -> f32 {
 
 fn default_recommendation_size() -> usize {
     40
+}
+
+fn default_ai_mix_size() -> usize {
+    12
 }
 
 fn default_ui_scale() -> f32 {
@@ -371,9 +447,10 @@ struct AiMixCandidate {
     title: String,
     artist: String,
     genre: String,
+    familiarity: &'static str,
 }
 
-type AiMixMessage = Result<(String, Vec<usize>), String>;
+type AiMixMessage = Result<(String, Vec<usize>, AiUsage), String>;
 
 #[derive(Clone, Copy)]
 enum MediaKeyCommand {
@@ -481,6 +558,13 @@ struct PlayerApp {
     prefer_unplayed: bool,
     recommendation_variety: f32,
     recommendation_size: usize,
+    ai_recommendations_enabled: bool,
+    google_ai_model: GeminiModel,
+    google_ai_thinking: GeminiThinking,
+    ai_mix_size: usize,
+    google_ai_usage: AiUsage,
+    google_ai_requests: u64,
+    google_ai_last_usage: Option<AiUsage>,
     ui_scale: f32,
     volume: f32,
     home_genre: String,
@@ -559,12 +643,18 @@ struct PlayerApp {
     media_key_sender: Sender<MediaKeyCommand>,
     ai_mix_prompt: String,
     ai_mix_results: Vec<usize>,
+    ai_recommendation_indices: Vec<usize>,
+    ai_recommendation_mode: bool,
     ai_mix_pending: bool,
     ai_mix_status: String,
     ai_mix_receiver: Receiver<AiMixMessage>,
     ai_mix_sender: Sender<AiMixMessage>,
     google_ai_key_draft: String,
     google_ai_key_saved: bool,
+    developer_output_open: bool,
+    developer_output: VecDeque<String>,
+    last_status_seen: String,
+    error_notification: Option<(String, Instant)>,
     #[cfg(target_os = "windows")]
     media_controls: Option<MediaControls>,
     #[cfg(target_os = "windows")]
@@ -609,6 +699,13 @@ impl PlayerApp {
             prefer_unplayed: preferences.prefer_unplayed,
             recommendation_variety: preferences.recommendation_variety.clamp(0.0, 1.0),
             recommendation_size: preferences.recommendation_size.clamp(20, 100),
+            ai_recommendations_enabled: preferences.ai_recommendations_enabled,
+            google_ai_model: preferences.google_ai_model,
+            google_ai_thinking: preferences.google_ai_thinking,
+            ai_mix_size: preferences.ai_mix_size.clamp(4, 20),
+            google_ai_usage: preferences.google_ai_usage,
+            google_ai_requests: preferences.google_ai_requests,
+            google_ai_last_usage: preferences.google_ai_last_usage,
             ui_scale: preferences.ui_scale.clamp(75.0, 150.0),
             volume: preferences.volume.clamp(0.0, 1.0),
             home_genre: String::new(),
@@ -694,12 +791,18 @@ impl PlayerApp {
             media_key_sender,
             ai_mix_prompt: String::new(),
             ai_mix_results: Vec::new(),
+            ai_recommendation_indices: Vec::new(),
+            ai_recommendation_mode: false,
             ai_mix_pending: false,
             ai_mix_status: String::new(),
             ai_mix_receiver,
             ai_mix_sender,
             google_ai_key_draft: String::new(),
             google_ai_key_saved: google_ai_key_exists(),
+            developer_output_open: false,
+            developer_output: VecDeque::new(),
+            last_status_seen: String::new(),
+            error_notification: None,
             #[cfg(target_os = "windows")]
             media_controls: None,
             #[cfg(target_os = "windows")]
@@ -2576,6 +2679,13 @@ impl PlayerApp {
             prefer_unplayed: self.prefer_unplayed,
             recommendation_variety: self.recommendation_variety,
             recommendation_size: self.recommendation_size,
+            ai_recommendations_enabled: self.ai_recommendations_enabled,
+            google_ai_model: self.google_ai_model,
+            google_ai_thinking: self.google_ai_thinking,
+            ai_mix_size: self.ai_mix_size,
+            google_ai_usage: self.google_ai_usage,
+            google_ai_requests: self.google_ai_requests,
+            google_ai_last_usage: self.google_ai_last_usage,
             ui_scale: self.ui_scale,
             volume: self.volume,
             duplicate_scan_enabled: self.duplicate_scan_enabled,
@@ -3894,6 +4004,31 @@ impl PlayerApp {
             )
             .color(Color32::GRAY),
         );
+        if self.ai_recommendations_enabled {
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        !self.ai_mix_pending,
+                        egui::Button::new(if self.ai_mix_pending {
+                            "Updating…"
+                        } else {
+                            "✦ Improve For you with AI"
+                        }),
+                    )
+                    .clicked()
+                {
+                    self.request_ai_recommendations(ui.ctx());
+                }
+                ui.label(RichText::new("Runs only when clicked; sends up to 48 short song labels with liked/played/new tags.").small().color(Color32::GRAY));
+            });
+            if !self.ai_mix_status.is_empty() {
+                ui.label(
+                    RichText::new(&self.ai_mix_status)
+                        .small()
+                        .color(accent_color(&self.accent)),
+                );
+            }
+        }
         ui.add_space(12.0);
         self.show_mix_studio(ui);
         ui.add_space(18.0);
@@ -3987,7 +4122,45 @@ impl PlayerApp {
                     ui.heading("Mix Studio");
                     ui.label(RichText::new("Optional · Google AI").small().color(Color32::GRAY));
                 });
-                ui.label(RichText::new("Describe a mood or moment. Lilt sends a short prompt and a small set of song labels to make a mix.").small().color(Color32::GRAY));
+        ui.label(RichText::new("Describe a mood or moment. Lilt sends a short prompt and up to 48 song labels with liked, played, or new tags to make a mix.").small().color(Color32::GRAY));
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Model");
+                    let model_changed = egui::ComboBox::from_id_salt("mix-studio-model")
+                        .selected_text(self.google_ai_model.label())
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::FlashLite, GeminiModel::FlashLite.label()).changed();
+                            changed |= ui.selectable_value(&mut self.google_ai_model, GeminiModel::Flash, GeminiModel::Flash.label()).changed();
+                            changed
+                        }).inner.unwrap_or(false);
+                    if model_changed { self.save_state(); }
+                    ui.label("Thinking");
+                    let thinking_changed = egui::ComboBox::from_id_salt("mix-studio-thinking")
+                        .selected_text(match self.google_ai_thinking { GeminiThinking::Minimal => "Minimal · lowest usage", GeminiThinking::Low => "Low · more planning" })
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Minimal, "Minimal · lowest usage").changed();
+                            changed |= ui.selectable_value(&mut self.google_ai_thinking, GeminiThinking::Low, "Low · more planning").changed();
+                            changed
+                        }).inner.unwrap_or(false);
+                    if thinking_changed { self.save_state(); }
+                    ui.label("Tracks");
+                    let size_changed = egui::ComboBox::from_id_salt("mix-studio-size")
+                        .selected_text(self.ai_mix_size.to_string())
+                        .show_ui(ui, |ui| {
+                            let mut changed = false;
+                            for size in [8, 12, 16, 20] {
+                                changed |= ui.selectable_value(&mut self.ai_mix_size, size, size.to_string()).changed();
+                            }
+                            changed
+                        }).inner.unwrap_or(false);
+                    if size_changed { self.save_state(); }
+                });
+                if ui.checkbox(&mut self.ai_recommendations_enabled, "Use AI when I refresh For you recommendations (off by default)").changed() {
+                    if !self.ai_recommendations_enabled { self.ai_recommendation_indices.clear(); }
+                    self.save_state();
+                }
+                ui.label(RichText::new("AI recommendation refresh runs only when clicked. Google receives at most 48 short song labels and liked/played/new tags; no paths or audio.").small().color(Color32::GRAY));
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.ai_mix_prompt).desired_width(ui.available_width() - 130.0).hint_text("e.g. energetic electronic for a night drive"));
                     if ui.add_enabled(!self.ai_mix_pending, egui::Button::new(if self.ai_mix_pending { "Making…" } else { "Create mix" })).clicked() {
@@ -4001,6 +4174,18 @@ impl PlayerApp {
                     });
                 }
                 if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
+                ui.separator();
+                ui.label(RichText::new("Google AI usage reported to Lilt").strong());
+                if let Some(usage) = self.google_ai_last_usage {
+                    ui.label(format!("Last request · input {} · output {} · thinking {} · total {} tokens", usage.prompt_tokens, usage.output_tokens, usage.thinking_tokens, usage.total_tokens));
+                } else {
+                    ui.label("Last request · no usage data yet");
+                }
+                ui.label(format!("Lilt total · {} requests · {} input · {} output · {} thinking · {} total tokens", self.google_ai_requests, self.google_ai_usage.prompt_tokens, self.google_ai_usage.output_tokens, self.google_ai_usage.thinking_tokens, self.google_ai_usage.total_tokens));
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Google does not return remaining project quota to this app.").small().color(Color32::GRAY));
+                    ui.hyperlink_to("View Google AI usage and limits", "https://aistudio.google.com/usage");
+                });
                 if !self.ai_mix_results.is_empty() {
                     ui.horizontal(|ui| {
                         ui.label(format!("{} picks", self.ai_mix_results.len()));
@@ -7104,7 +7289,7 @@ impl PlayerApp {
         ui.add_space(14.0);
         ui.separator();
         ui.heading("Mix Studio");
-        ui.label(RichText::new("Use your own Google AI key to create a short, personalized mix. The key is stored in Windows Credential Manager. A short theme and up to 48 song titles, artists, and genres are sent to Google; no file paths or audio are sent. Google usage limits and billing may apply.").small().color(Color32::GRAY));
+        ui.label(RichText::new("Use your own Google AI key for Mix Studio or optional AI-assisted recommendations. The key is stored in Windows Credential Manager. When you request a mix or refresh, a short prompt and up to 48 song titles, artists, genres, and liked/played/new tags are sent to Google; no file paths or audio are sent. Google usage limits and billing may apply.").small().color(Color32::GRAY));
         ui.horizontal(|ui| {
             ui.label("Google AI key");
             ui.add(egui::TextEdit::singleline(&mut self.google_ai_key_draft).password(true).hint_text("Paste your API key"));
@@ -7431,7 +7616,26 @@ impl PlayerApp {
             self.recommendations = self.compute_recommendations();
             self.recommendations_dirty = false;
         }
-        self.recommendations.clone()
+        let mut result = Vec::with_capacity(self.recommendations.len());
+        let mut seen = HashSet::new();
+        if self.ai_recommendations_enabled {
+            for &index in &self.ai_recommendation_indices {
+                let available = self.tracks.get(index).is_some_and(|track| {
+                    !self.disliked_songs.contains(&track.path)
+                        && !self.excluded_tracks.contains(&track.path)
+                });
+                if available && seen.insert(index) {
+                    result.push(index);
+                }
+            }
+        }
+        result.extend(
+            self.recommendations
+                .iter()
+                .copied()
+                .filter(|index| seen.insert(*index)),
+        );
+        result
     }
 
     fn compute_recommendations(&self) -> Vec<usize> {
@@ -7477,6 +7681,13 @@ impl PlayerApp {
                     title: compact_metadata(&track.title, 42),
                     artist: compact_metadata(&display_credit(&track.artist), 28),
                     genre: compact_metadata(&track.genre, 20),
+                    familiarity: if self.liked_songs.contains(&track.path) {
+                        "liked"
+                    } else if self.history.contains(&track.path) {
+                        "played"
+                    } else {
+                        "new"
+                    },
                 })
             })
             .take(48)
@@ -7490,9 +7701,13 @@ impl PlayerApp {
         self.ai_mix_status = format!("Making a mix from {} short track labels…", candidates.len());
         let sender = self.ai_mix_sender.clone();
         let repaint = context.clone();
+        let model = self.google_ai_model;
+        let thinking = self.google_ai_thinking;
+        let mix_size = self.ai_mix_size;
         thread::spawn(move || {
-            let result = generate_google_ai_mix(&api_key, &theme, &candidates);
-            let _ = sender.send(result.map(|indices| (theme, indices)));
+            let result =
+                generate_google_ai_mix(&api_key, &theme, &candidates, model, thinking, mix_size);
+            let _ = sender.send(result.map(|(indices, usage)| (theme, indices, usage)));
             request_repaint_when_focused(&repaint);
         });
     }
@@ -7501,14 +7716,95 @@ impl PlayerApp {
         while let Ok(result) = self.ai_mix_receiver.try_recv() {
             self.ai_mix_pending = false;
             match result {
-                Ok((theme, indices)) => {
+                Ok((theme, indices, usage)) => {
+                    self.google_ai_last_usage = Some(usage);
+                    self.google_ai_usage.prompt_tokens = self
+                        .google_ai_usage
+                        .prompt_tokens
+                        .saturating_add(usage.prompt_tokens);
+                    self.google_ai_usage.output_tokens = self
+                        .google_ai_usage
+                        .output_tokens
+                        .saturating_add(usage.output_tokens);
+                    self.google_ai_usage.thinking_tokens = self
+                        .google_ai_usage
+                        .thinking_tokens
+                        .saturating_add(usage.thinking_tokens);
+                    self.google_ai_usage.total_tokens = self
+                        .google_ai_usage
+                        .total_tokens
+                        .saturating_add(usage.total_tokens);
+                    self.google_ai_requests = self.google_ai_requests.saturating_add(1);
                     self.ai_mix_prompt = theme.clone();
-                    self.ai_mix_results = indices;
-                    self.ai_mix_status =
-                        format!("{} tracks ready for {theme}.", self.ai_mix_results.len());
+                    self.ai_mix_results = indices.clone();
+                    if self.ai_recommendation_mode {
+                        self.ai_recommendation_indices = indices;
+                        self.recommendations_dirty = false;
+                        self.ai_mix_status = format!(
+                            "Updated For you with {} AI-assisted picks.",
+                            self.ai_recommendation_indices.len()
+                        );
+                    } else {
+                        self.ai_mix_status =
+                            format!("{} tracks ready for {theme}.", self.ai_mix_results.len());
+                    }
+                    self.ai_recommendation_mode = false;
+                    self.save_state();
                 }
-                Err(error) => self.ai_mix_status = error,
+                Err(error) => {
+                    self.ai_mix_status = error.clone();
+                    self.status = error;
+                    self.ai_recommendation_mode = false;
+                }
             }
+        }
+    }
+
+    fn capture_status_output(&mut self, context: &egui::Context) {
+        if self.status.is_empty() || self.status == self.last_status_seen {
+            return;
+        }
+        self.last_status_seen.clone_from(&self.status);
+        let message = compact_metadata(&self.status, 500);
+        let lower = message.to_lowercase();
+        let is_error = [
+            "error",
+            "failed",
+            "could not",
+            "unable",
+            "invalid",
+            "blocked",
+            "stopped before",
+            "no candidate",
+            "no text part",
+        ]
+        .iter()
+        .any(|needle| lower.contains(needle));
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let level = if is_error { "ERROR" } else { "INFO" };
+        self.developer_output
+            .push_back(format!("{time} [{level}] {message}"));
+        while self.developer_output.len() > 250 {
+            self.developer_output.pop_front();
+        }
+        if is_error {
+            self.error_notification = Some((message, Instant::now()));
+            context.request_repaint_after(Duration::from_secs(6));
+        }
+    }
+
+    fn request_ai_recommendations(&mut self, context: &egui::Context) {
+        if !self.ai_recommendations_enabled {
+            return;
+        }
+        self.ai_mix_prompt = "Recommend a balanced For you mix using familiar artists, liked tracks, and a few new discoveries.".into();
+        self.ai_recommendation_mode = true;
+        self.request_ai_mix(context);
+        if !self.ai_mix_pending {
+            self.ai_recommendation_mode = false;
         }
     }
 
@@ -7707,6 +8003,7 @@ impl eframe::App for PlayerApp {
             self.poll_media_key_commands();
             self.poll_ai_mix();
         }
+        self.capture_status_output(ctx);
         if !self.artwork_pending.is_empty() {
             if window_focused {
                 ctx.request_repaint_after(Duration::from_millis(50));
@@ -7932,6 +8229,13 @@ impl eframe::App for PlayerApp {
                     ui.separator();
                     if ui.button("Open Now Playing").clicked() {
                         self.now_playing_expanded = true;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .selectable_label(self.developer_output_open, "Developer Output")
+                        .clicked()
+                    {
+                        self.developer_output_open = !self.developer_output_open;
                         ui.close_menu();
                     }
                     if ui
@@ -8952,6 +9256,51 @@ impl eframe::App for PlayerApp {
                 ui.add_space(6.0);
             });
 
+        if self.developer_output_open {
+            egui::SidePanel::right("developer-output-panel")
+                .resizable(true)
+                .default_width(360.0)
+                .min_width(250.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading("Developer Output");
+                        if ui.small_button("Clear").clicked() {
+                            self.developer_output.clear();
+                        }
+                        if ui.small_button("×").clicked() {
+                            self.developer_output_open = false;
+                        }
+                    });
+                    ui.label(
+                        RichText::new("Local app status and errors · no API keys are logged")
+                            .small()
+                            .color(Color32::GRAY),
+                    );
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("developer-output-scroll")
+                        .stick_to_bottom(true)
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if self.developer_output.is_empty() {
+                                ui.label(
+                                    RichText::new("Waiting for app output…").color(Color32::GRAY),
+                                );
+                            }
+                            for entry in &self.developer_output {
+                                let is_error = entry.contains("[ERROR]");
+                                ui.label(RichText::new(entry).monospace().size(11.0).color(
+                                    if is_error {
+                                        Color32::from_rgb(255, 105, 110)
+                                    } else {
+                                        Color32::from_rgb(190, 196, 210)
+                                    },
+                                ));
+                            }
+                        });
+                });
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             let player_transition = if self.animations_enabled {
                 ctx.animate_bool_with_time(
@@ -8971,6 +9320,43 @@ impl eframe::App for PlayerApp {
                 self.show_library(ui);
             }
         });
+
+        if let Some((message, created)) = self.error_notification.clone() {
+            if created.elapsed() < Duration::from_secs(8) {
+                ctx.request_repaint_after(Duration::from_millis(250));
+                let mut dismiss = false;
+                egui::Area::new(egui::Id::new("error-notification"))
+                    .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-18.0, 58.0))
+                    .order(egui::Order::Foreground)
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style())
+                            .fill(Color32::from_rgb(48, 24, 29))
+                            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(192, 69, 77)))
+                            .inner_margin(egui::Margin::symmetric(14, 10))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        ui.label(
+                                            RichText::new("Lilt needs attention")
+                                                .strong()
+                                                .color(Color32::from_rgb(255, 135, 140)),
+                                        );
+                                        ui.label(message);
+                                        if ui.small_button("Open Developer Output").clicked() {
+                                            self.developer_output_open = true;
+                                        }
+                                    });
+                                    dismiss = ui.small_button("×").clicked();
+                                });
+                            });
+                    });
+                if dismiss {
+                    self.error_notification = None;
+                }
+            } else {
+                self.error_notification = None;
+            }
+        }
 
         self.show_properties_window(ctx);
 
@@ -10371,7 +10757,10 @@ fn generate_google_ai_mix(
     key: &str,
     theme: &str,
     candidates: &[AiMixCandidate],
-) -> Result<Vec<usize>, String> {
+    model: GeminiModel,
+    thinking: GeminiThinking,
+    mix_size: usize,
+) -> Result<(Vec<usize>, AiUsage), String> {
     let entries = candidates
         .iter()
         .enumerate()
@@ -10381,34 +10770,90 @@ fn generate_google_ai_mix(
                 "title": candidate.title,
                 "artist": candidate.artist,
                 "genre": candidate.genre,
+                "familiarity": candidate.familiarity,
             })
         })
         .collect::<Vec<_>>();
-    let prompt = format!("Create a cohesive music mix for this mood: {}. Choose 8 to 20 items from the supplied list, balancing mood and variety. Return only a JSON array of integer ids, no explanation. List: {}", compact_metadata(theme, 120), serde_json::to_string(&entries).unwrap_or_default());
+    let prompt = format!("Create a cohesive music mix for this request: {}. Choose up to {} items from the supplied list, balancing familiarity and discovery. Return only a JSON array of integer ids, no explanation. List: {}", compact_metadata(theme, 120), mix_size.clamp(4, 20), serde_json::to_string(&entries).unwrap_or_default());
     let body = serde_json::json!({
         "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 64}
+        "generationConfig": {
+            "thinkingConfig": {"thinkingLevel": thinking.id()},
+            "maxOutputTokens": 64 + (mix_size.clamp(4, 20) as u64 * 5) + if thinking == GeminiThinking::Low { 64 } else { 0 }
+        }
     });
-    let response = google_ai_post(key, &body.to_string())?;
+    let response = google_ai_post(key, &body.to_string(), model)?;
     let value: serde_json::Value = serde_json::from_str(&response)
         .map_err(|_| "Google returned an unreadable response. Try again.".to_string())?;
+    let usage_metadata = value
+        .get("usageMetadata")
+        .unwrap_or(&serde_json::Value::Null);
+    let usage = AiUsage {
+        prompt_tokens: usage_metadata
+            .get("promptTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        output_tokens: usage_metadata
+            .get("candidatesTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        thinking_tokens: usage_metadata
+            .get("thoughtsTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+        total_tokens: usage_metadata
+            .get("totalTokenCount")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0),
+    };
     if let Some(message) = value.pointer("error.message").and_then(|v| v.as_str()) {
         return Err(format!(
             "Google AI error: {}",
             compact_metadata(message, 240)
         ));
     }
-    let text = value
-        .pointer("candidates.0.content.parts.0.text")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| "Google returned no mix. Check your key and try again.".to_string())?;
+    let candidates_response = value
+        .get("candidates")
+        .and_then(serde_json::Value::as_array);
+    let Some(candidate) = candidates_response.and_then(|items| items.first()) else {
+        let reason = value
+            .pointer("promptFeedback.blockReason")
+            .and_then(serde_json::Value::as_str)
+            .map(|reason| format!("Google blocked the prompt ({reason}). Try a different description."))
+            .unwrap_or_else(|| "Google returned no candidate text. Try a shorter description or check your API key's model access.".to_string());
+        return Err(reason);
+    };
+    let parts = candidate
+        .pointer("content.parts")
+        .and_then(serde_json::Value::as_array);
+    let text = parts
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("thought").and_then(serde_json::Value::as_bool) != Some(true))
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        let reason = candidate
+            .get("finishReason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no text part");
+        return Err(format!("Google stopped before returning a mix ({reason}). Try again; if it repeats, check the developer output."));
+    }
     let cleaned = text
         .trim()
         .trim_start_matches("```json")
         .trim_start_matches("```")
         .trim_end_matches("```")
         .trim();
-    let ids: Vec<usize> = serde_json::from_str(cleaned).map_err(|_| {
+    let json_text = if cleaned.starts_with('[') && cleaned.ends_with(']') {
+        cleaned
+    } else if let (Some(start), Some(end)) = (cleaned.find('['), cleaned.rfind(']')) {
+        &cleaned[start..=end]
+    } else {
+        return Err("Google's response did not contain a song list. Try a simpler mood.".into());
+    };
+    let ids: Vec<usize> = serde_json::from_str(json_text).map_err(|_| {
         "Google's response was not a list of song ids. Try a simpler mood.".to_string()
     })?;
     let mut seen = HashSet::new();
@@ -10420,7 +10865,7 @@ fn generate_google_ai_mix(
     if indices.is_empty() {
         Err("Google did not choose any valid songs. Try again.".into())
     } else {
-        Ok(indices)
+        Ok((indices, usage))
     }
 }
 
@@ -10514,7 +10959,7 @@ fn wide_null(value: &str) -> Vec<u16> {
 }
 
 #[cfg(windows)]
-fn google_ai_post(key: &str, body: &str) -> Result<String, String> {
+fn google_ai_post(key: &str, body: &str, model: GeminiModel) -> Result<String, String> {
     use std::{ffi::c_void, ptr};
     use windows_sys::Win32::Networking::WinHttp::*;
     unsafe {
@@ -10536,7 +10981,7 @@ fn google_ai_post(key: &str, body: &str) -> Result<String, String> {
             WinHttpCloseHandle(session);
             return Err("Could not connect to Google AI.".into());
         }
-        let path = wide_null("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+        let path = wide_null(&format!("/v1beta/models/{}:generateContent", model.id()));
         let post = wide_null("POST");
         let request = WinHttpOpenRequest(
             connection,
@@ -10627,7 +11072,7 @@ fn google_ai_post(key: &str, body: &str) -> Result<String, String> {
     }
 }
 #[cfg(not(windows))]
-fn google_ai_post(_: &str, _: &str) -> Result<String, String> {
+fn google_ai_post(_: &str, _: &str, _: GeminiModel) -> Result<String, String> {
     Err("Google AI mix generation is supported on Windows only.".into())
 }
 
