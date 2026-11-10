@@ -1,16 +1,22 @@
 # Lilt Player (Rust)
 
+![Lilt app icon](assets/app_icon.png)
+
 Native Windows desktop player. It does not need Python or a Python runtime.
 
 ## Build
 
 Install the stable Rust toolchain with the MSVC target and run `build-release.bat`.
-The optimized standalone executable is written to `target\release\lilt-player.exe`.
+The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.0-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.0-windows-x64.msi` as a per-user installer. The MSI adds Lilt to the user's Programs folder and creates Start Menu and Desktop shortcuts.
+
+The release script installs WiX Toolset 7 locally if needed. On a fresh setup, read and accept the WiX EULA once with `.\\.tools\\wix.exe eula accept wix7` before building the MSI.
 
 ## Current features
 
 - Background folder scanning, metadata, embedded album artwork, and library search
-- Larger YouTube Music-inspired layout with Home, Songs, Albums, Artists, Likes, Playlists,
+- Home and Discover pages with personalized recommendations, genre and decade mixes, and artist radio
+- File, Playback, View, Help, and Playlists menus; playlists remain available in the sidebar
+- Larger YouTube Music-inspired layout with Songs, Albums, Artists, Likes, Playlists,
   History, Disliked, Lyrics, and Settings navigation
 - Grid, details, and list views; customizable accent, discovery balance, recommendation variety and
   size, unplayed-song priority, and library folders
