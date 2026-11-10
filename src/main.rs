@@ -60,80 +60,39 @@ fn show_custom_window_controls(ui: &mut egui::Ui, context: &egui::Context) {
 }
 
 fn show_custom_window_resize_grips(context: &egui::Context) {
-    if context.input(|input| input.viewport().maximized.unwrap_or(false)) {
+    let (maximized, pressed, pointer_pos) = context.input(|input| {
+        (
+            input.viewport().maximized.unwrap_or(false),
+            input.pointer.button_pressed(egui::PointerButton::Primary),
+            input.pointer.interact_pos(),
+        )
+    });
+    if maximized || !pressed {
         return;
     }
     let bounds = context.screen_rect();
-    let border = 6.0;
-    egui::Area::new(egui::Id::new("custom-window-resize-grips"))
-        .order(egui::Order::Foreground)
-        .fixed_pos(bounds.min)
-        .show(context, |ui| {
-            ui.set_min_size(bounds.size());
-            let local = egui::Rect::from_min_size(egui::Pos2::ZERO, bounds.size());
-            let corners = border * 2.0;
-            let zones = [
-                (
-                    egui::Rect::from_min_size(local.min, egui::vec2(corners, corners)),
-                    egui::ResizeDirection::NorthWest,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.right() - corners, local.top()),
-                        egui::vec2(corners, corners),
-                    ),
-                    egui::ResizeDirection::NorthEast,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.left(), local.bottom() - corners),
-                        egui::vec2(corners, corners),
-                    ),
-                    egui::ResizeDirection::SouthWest,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.right() - corners, local.bottom() - corners),
-                        egui::vec2(corners, corners),
-                    ),
-                    egui::ResizeDirection::SouthEast,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.left() + corners, local.top()),
-                        egui::vec2(local.width() - corners * 2.0, border),
-                    ),
-                    egui::ResizeDirection::North,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.left() + corners, local.bottom() - border),
-                        egui::vec2(local.width() - corners * 2.0, border),
-                    ),
-                    egui::ResizeDirection::South,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.left(), local.top() + corners),
-                        egui::vec2(border, local.height() - corners * 2.0),
-                    ),
-                    egui::ResizeDirection::West,
-                ),
-                (
-                    egui::Rect::from_min_size(
-                        egui::pos2(local.right() - border, local.top() + corners),
-                        egui::vec2(border, local.height() - corners * 2.0),
-                    ),
-                    egui::ResizeDirection::East,
-                ),
-            ];
-            for (index, (rect, direction)) in zones.into_iter().enumerate() {
-                let response = ui.interact(rect, ui.id().with(index), egui::Sense::drag());
-                if response.drag_started() {
-                    context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
-                }
-            }
-        });
+    let Some(pointer_pos) = pointer_pos else {
+        return;
+    };
+    let border = 8.0;
+    let near_left = pointer_pos.x <= bounds.left() + border;
+    let near_right = pointer_pos.x >= bounds.right() - border;
+    let near_top = pointer_pos.y <= bounds.top() + border;
+    let near_bottom = pointer_pos.y >= bounds.bottom() - border;
+    let direction = match (near_left, near_right, near_top, near_bottom) {
+        (true, _, true, _) => Some(egui::ResizeDirection::NorthWest),
+        (_, true, true, _) => Some(egui::ResizeDirection::NorthEast),
+        (true, _, _, true) => Some(egui::ResizeDirection::SouthWest),
+        (_, true, _, true) => Some(egui::ResizeDirection::SouthEast),
+        (_, _, true, _) => Some(egui::ResizeDirection::North),
+        (_, _, _, true) => Some(egui::ResizeDirection::South),
+        (true, _, _, _) => Some(egui::ResizeDirection::West),
+        (_, true, _, _) => Some(egui::ResizeDirection::East),
+        _ => None,
+    };
+    if let Some(direction) = direction {
+        context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+    }
 }
 
 fn splash_background(elapsed: f32) -> Color32 {
@@ -8430,6 +8389,11 @@ impl eframe::App for PlayerApp {
                         if drag.drag_started() {
                             ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                         }
+                        if drag.double_clicked() {
+                            let maximized =
+                                ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
                         show_custom_window_controls(ui, ctx);
                     });
                 });
@@ -8482,6 +8446,21 @@ impl eframe::App for PlayerApp {
                         let maximized =
                             ctx.input(|input| input.viewport().maximized.unwrap_or(false));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                    }
+                    let drag_width = (ui.available_width() - 900.0).clamp(0.0, 700.0);
+                    if drag_width > 4.0 {
+                        let drag_space = ui.add_sized(
+                            [drag_width, 34.0],
+                            egui::Label::new("").sense(egui::Sense::click_and_drag()),
+                        );
+                        if drag_space.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        if drag_space.double_clicked() {
+                            let maximized =
+                                ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
                     }
                     ui.menu_button("☰ Menu", |ui| {
                         ui.menu_button("File", |ui| {
