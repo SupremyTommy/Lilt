@@ -1,7 +1,7 @@
 @echo off
 setlocal
 set "PATH=%USERPROFILE%\.cargo\bin;%PATH%"
-set "VERSION=0.2.0"
+set "VERSION=0.2.1"
 set "PACKAGE=dist\Lilt-v%VERSION%-windows-x64"
 set "ARCHIVE=dist\Lilt-v%VERSION%-windows-x64.zip"
 
@@ -24,7 +24,10 @@ if errorlevel 1 exit /b %errorlevel%
 
 if not exist ".tools\wix.exe" dotnet tool install --tool-path .tools wix --version 7.0.1
 if errorlevel 1 exit /b %errorlevel%
-.tools\wix.exe build installer\Package.wxs -o "dist\Lilt-v%VERSION%-windows-x64.msi"
+.tools\wix.exe extension list -g | findstr /b /c:"WixToolset.UI.wixext 7.0.1" >nul
+if errorlevel 1 .tools\wix.exe extension add -g WixToolset.UI.wixext/7.0.1
+if errorlevel 1 exit /b %errorlevel%
+.tools\wix.exe build installer\Package.wxs -ext WixToolset.UI.wixext/7.0.1 -o "dist\Lilt-v%VERSION%-windows-x64.msi"
 if errorlevel 1 exit /b %errorlevel%
 del /q "dist\Lilt-v%VERSION%-windows-x64.wixpdb" 2>nul
 

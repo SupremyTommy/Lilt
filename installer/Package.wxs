@@ -1,13 +1,21 @@
-<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Lilt" Manufacturer="UltimateBloxStudium"
-           Version="0.2.0" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
+           Version="0.2.1" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
            Scope="perUser" InstallerVersion="500">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lilt is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="LiltIcon" SourceFile="assets/app_icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="LiltIcon" />
+    <ui:WixUI Id="WixUI_FeatureTree" />
     <Feature Id="MainFeature" Title="Lilt" Level="1">
       <ComponentGroupRef Id="LiltFiles" />
+    </Feature>
+    <Feature Id="StartMenuShortcutFeature" Title="Start Menu shortcut" Description="Add Lilt to the Start Menu." Level="1">
+      <ComponentRef Id="StartMenuShortcutComponent" />
+    </Feature>
+    <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="Add a Lilt shortcut to the Desktop." Level="1">
+      <ComponentRef Id="DesktopShortcutComponent" />
     </Feature>
   </Package>
 
@@ -16,22 +24,17 @@
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Lilt">
           <Component Id="LiltExecutable" Guid="*">
-            <File Id="LiltExe" Source="dist/Lilt-v0.2.0-windows-x64/lilt-player.exe" KeyPath="yes">
-              <Shortcut Id="StartMenuShortcut" Directory="LiltStartMenuFolder" Name="Lilt"
-                        WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
-              <Shortcut Id="DesktopShortcut" Directory="DesktopFolder" Name="Lilt"
-                        WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
-            </File>
+            <File Id="LiltExe" Source="dist/Lilt-v0.2.1-windows-x64/lilt-player.exe" KeyPath="yes" />
             <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="Installed" Type="integer" Value="1" />
           </Component>
           <Component Id="LiltPngIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.0-windows-x64/app_icon.png" />
+            <File Source="dist/Lilt-v0.2.1-windows-x64/app_icon.png" />
           </Component>
           <Component Id="LiltIcoIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.0-windows-x64/app_icon.ico" />
+            <File Source="dist/Lilt-v0.2.1-windows-x64/app_icon.ico" />
           </Component>
           <Component Id="LiltReadme" Guid="*">
-            <File Source="dist/Lilt-v0.2.0-windows-x64/README.md" />
+            <File Source="dist/Lilt-v0.2.1-windows-x64/README.md" />
           </Component>
         </Directory>
       </Directory>
@@ -39,7 +42,20 @@
     <StandardDirectory Id="ProgramMenuFolder">
       <Directory Id="LiltStartMenuFolder" Name="Lilt" />
     </StandardDirectory>
-    <StandardDirectory Id="DesktopFolder" />
+    <DirectoryRef Id="LiltStartMenuFolder">
+      <Component Id="StartMenuShortcutComponent" Guid="*">
+        <Shortcut Id="StartMenuShortcut" Name="Lilt" Target="[#LiltExe]"
+                  WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
+        <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="StartMenuShortcut" Type="integer" Value="1" />
+      </Component>
+    </DirectoryRef>
+    <StandardDirectory Id="DesktopFolder">
+      <Component Id="DesktopShortcutComponent" Guid="*">
+        <Shortcut Id="DesktopShortcut" Name="Lilt" Target="[#LiltExe]"
+                  WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
+        <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="DesktopShortcut" Type="integer" Value="1" />
+      </Component>
+    </StandardDirectory>
   </Fragment>
 
   <Fragment>
