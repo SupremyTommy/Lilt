@@ -28,6 +28,199 @@ const APP_NAME: &str = "Lilt";
 // from retaining gigabytes of duplicated image data in RAM.
 const MAX_CACHED_ARTWORK_BYTES: usize = 2 * 1024 * 1024;
 const AUDIO_EXTENSIONS: &[&str] = &["mp3", "flac", "wav", "m4a", "ogg", "opus", "aac", "wma"];
+
+fn show_custom_window_controls(ui: &mut egui::Ui, context: &egui::Context) {
+    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+        if ui
+            .add_sized([42.0, 34.0], egui::Button::new("×"))
+            .on_hover_text("Close")
+            .clicked()
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
+        if ui
+            .add_sized(
+                [42.0, 34.0],
+                egui::Button::new(if maximized { "❐" } else { "□" }),
+            )
+            .on_hover_text(if maximized { "Restore" } else { "Maximize" })
+            .clicked()
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+        if ui
+            .add_sized([42.0, 34.0], egui::Button::new("—"))
+            .on_hover_text("Minimize")
+            .clicked()
+        {
+            context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+        }
+    });
+}
+
+fn show_custom_window_resize_grips(context: &egui::Context) {
+    if context.input(|input| input.viewport().maximized.unwrap_or(false)) {
+        return;
+    }
+    let bounds = context.screen_rect();
+    let border = 6.0;
+    egui::Area::new(egui::Id::new("custom-window-resize-grips"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(bounds.min)
+        .show(context, |ui| {
+            ui.set_min_size(bounds.size());
+            let local = egui::Rect::from_min_size(egui::Pos2::ZERO, bounds.size());
+            let corners = border * 2.0;
+            let zones = [
+                (
+                    egui::Rect::from_min_size(local.min, egui::vec2(corners, corners)),
+                    egui::ResizeDirection::NorthWest,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.right() - corners, local.top()),
+                        egui::vec2(corners, corners),
+                    ),
+                    egui::ResizeDirection::NorthEast,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.left(), local.bottom() - corners),
+                        egui::vec2(corners, corners),
+                    ),
+                    egui::ResizeDirection::SouthWest,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.right() - corners, local.bottom() - corners),
+                        egui::vec2(corners, corners),
+                    ),
+                    egui::ResizeDirection::SouthEast,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.left() + corners, local.top()),
+                        egui::vec2(local.width() - corners * 2.0, border),
+                    ),
+                    egui::ResizeDirection::North,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.left() + corners, local.bottom() - border),
+                        egui::vec2(local.width() - corners * 2.0, border),
+                    ),
+                    egui::ResizeDirection::South,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.left(), local.top() + corners),
+                        egui::vec2(border, local.height() - corners * 2.0),
+                    ),
+                    egui::ResizeDirection::West,
+                ),
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(local.right() - border, local.top() + corners),
+                        egui::vec2(border, local.height() - corners * 2.0),
+                    ),
+                    egui::ResizeDirection::East,
+                ),
+            ];
+            for (index, (rect, direction)) in zones.into_iter().enumerate() {
+                let response = ui.interact(rect, ui.id().with(index), egui::Sense::drag());
+                if response.drag_started() {
+                    context.send_viewport_cmd(egui::ViewportCommand::BeginResize(direction));
+                }
+            }
+        });
+}
+
+fn splash_background(elapsed: f32) -> Color32 {
+    let progress = (elapsed / 0.25).clamp(0.0, 1.0);
+    let eased = progress * progress * (3.0 - 2.0 * progress);
+    Color32::from_rgb(
+        (37.0 * (1.0 - eased)).round() as u8,
+        (46.0 * (1.0 - eased)).round() as u8,
+        (59.0 * (1.0 - eased)).round() as u8,
+    )
+}
+
+fn show_splash_overlay(context: &egui::Context, elapsed: f32) {
+    let fade_duration = 0.35;
+    if !(0.5..(0.5 + fade_duration)).contains(&elapsed) {
+        return;
+    }
+    let opacity = (1.0 - (elapsed - 0.5) / fade_duration).clamp(0.0, 1.0);
+    let alpha = (opacity * 255.0).round() as u8;
+    let bounds = context.screen_rect();
+    egui::Area::new(egui::Id::new("splash-fade-overlay"))
+        .order(egui::Order::Foreground)
+        .fixed_pos(bounds.min)
+        .show(context, |ui| {
+            let (rect, _) = ui.allocate_exact_size(bounds.size(), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 0.0, Color32::from_rgba_unmultiplied(0, 0, 0, alpha));
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "SupremyTommy",
+                egui::FontId::proportional(34.0),
+                Color32::from_rgba_unmultiplied(255, 255, 255, alpha),
+            );
+        });
+    context.request_repaint_after(Duration::from_millis(16));
+}
+
+#[cfg(target_os = "windows")]
+fn reveal_path_in_explorer(path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::{
+        System::Com::{CoInitializeEx, CoTaskMemFree, CoUninitialize, COINIT_APARTMENTTHREADED},
+        UI::Shell::{SHOpenFolderAndSelectItems, SHParseDisplayName},
+    };
+
+    let path = path.to_path_buf();
+    let _ = thread::Builder::new()
+        .name("reveal-in-explorer".into())
+        .spawn(move || {
+            let path = path.canonicalize().unwrap_or(path);
+            if !path.is_file() {
+                return;
+            }
+            let wide_path = path
+                .as_os_str()
+                .encode_wide()
+                .chain(Some(0))
+                .collect::<Vec<_>>();
+            unsafe {
+                if CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+                    return;
+                }
+                let mut item_id_list = std::ptr::null_mut();
+                let parsed = SHParseDisplayName(
+                    wide_path.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut item_id_list,
+                    0,
+                    std::ptr::null_mut(),
+                );
+                if parsed >= 0 && !item_id_list.is_null() {
+                    // With no child array, the fully qualified file PIDL is selected
+                    // in its parent folder by Explorer.
+                    let _ = SHOpenFolderAndSelectItems(item_id_list, 0, std::ptr::null(), 0);
+                    CoTaskMemFree(item_id_list.cast());
+                } else if let Some(folder) = path.parent() {
+                    // If the shell cannot parse the file path, at least open its folder.
+                    let _ = std::process::Command::new("explorer.exe")
+                        .arg(folder)
+                        .spawn();
+                }
+                CoUninitialize();
+            }
+        });
+}
+
 const ACCENTS: [(&str, Color32); 3] = [
     ("Blue", Color32::from_rgb(54, 97, 255)),
     ("Sky", Color32::from_rgb(0, 162, 255)),
@@ -670,6 +863,7 @@ struct PlayerApp {
     developer_output_open: bool,
     developer_output: VecDeque<String>,
     last_status_seen: String,
+    splash_started: Instant,
     error_notification: Option<(String, Instant)>,
     #[cfg(target_os = "windows")]
     media_controls: Option<MediaControls>,
@@ -821,6 +1015,7 @@ impl PlayerApp {
             developer_output_open: false,
             developer_output: VecDeque::new(),
             last_status_seen: String::new(),
+            splash_started: Instant::now(),
             error_notification: None,
             #[cfg(target_os = "windows")]
             media_controls: None,
@@ -1322,11 +1517,7 @@ impl PlayerApp {
             }
             if ui.button("↗  Reveal file in Explorer").clicked() {
                 #[cfg(target_os = "windows")]
-                {
-                    let _ = std::process::Command::new("explorer.exe")
-                        .arg(format!("/select,{}", path.display()))
-                        .spawn();
-                }
+                reveal_path_in_explorer(&path);
                 ui.close_menu();
             }
             if ui.button("◷  Clear this song from history").clicked() {
@@ -8194,10 +8385,54 @@ impl eframe::App for PlayerApp {
                 .insert(egui::TextStyle::Heading, egui::FontId::proportional(29.0));
         });
 
+        let splash_elapsed = self.splash_started.elapsed().as_secs_f32();
+        if splash_elapsed < 0.5 {
+            if window_focused {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
+            egui::CentralPanel::default()
+                .frame(egui::Frame::new().fill(splash_background(splash_elapsed)))
+                .show(ctx, |ui| {
+                    ui.centered_and_justified(|ui| {
+                        ui.label(
+                            RichText::new("SupremyTommy")
+                                .size(34.0)
+                                .strong()
+                                .color(Color32::WHITE),
+                        );
+                    });
+                });
+            return;
+        }
+
         if self.initial_library_loading {
             if window_focused {
                 ctx.request_repaint_after(Duration::from_millis(160));
             }
+            egui::TopBottomPanel::top("top-bar")
+                .frame(
+                    egui::Frame::new()
+                        .fill(Color32::from_rgb(14, 15, 22))
+                        .inner_margin(egui::Margin::symmetric(12, 5)),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.heading(
+                            RichText::new("♫ LILT  ·  SupremyTommy")
+                                .color(accent)
+                                .strong()
+                                .size(20.0),
+                        );
+                        let drag = ui.add_sized(
+                            [ui.available_width() - 150.0, 34.0],
+                            egui::Label::new("").sense(egui::Sense::click_and_drag()),
+                        );
+                        if drag.drag_started() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
+                        }
+                        show_custom_window_controls(ui, ctx);
+                    });
+                });
             egui::CentralPanel::default()
                 .frame(egui::Frame::new().fill(Color32::from_rgb(10, 11, 17)))
                 .show(ctx, |ui| {
@@ -8216,226 +8451,281 @@ impl eframe::App for PlayerApp {
                         });
                     });
                 });
+            show_splash_overlay(ctx, splash_elapsed);
+            show_custom_window_resize_grips(ctx);
             return;
         }
 
-        egui::TopBottomPanel::top("top-bar").show(ctx, |ui| {
-            let mut playlist_menu_action = None;
-            ui.horizontal(|ui| {
-                ui.heading(RichText::new("♫ LILT").color(accent).strong().size(22.0));
-                ui.add_space(4.0);
-                ui.menu_button("File", |ui| {
-                    if ui.button("Add music folder…").clicked() {
-                        self.add_folder();
-                        ui.close_menu();
+        egui::TopBottomPanel::top("top-bar")
+            .frame(
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(14, 15, 22))
+                    .inner_margin(egui::Margin::symmetric(12, 5)),
+            )
+            .show(ctx, |ui| {
+                let mut playlist_menu_action = None;
+                ui.horizontal(|ui| {
+                    let drag = ui.add_sized(
+                        [230.0, 34.0],
+                        egui::Label::new(
+                            RichText::new("♫ LILT  ·  SupremyTommy")
+                                .color(accent)
+                                .strong()
+                                .size(20.0),
+                        )
+                        .sense(egui::Sense::click_and_drag()),
+                    );
+                    if drag.drag_started() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
-                    if ui.button("Rescan library").clicked() {
-                        self.start_scan();
-                        ui.close_menu();
+                    if drag.double_clicked() {
+                        let maximized =
+                            ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                     }
-                    ui.separator();
-                    if ui.button("Quit Lilt").clicked() {
-                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-                ui.menu_button("Playback", |ui| {
-                    if ui.button("Play / Pause      Space").clicked() {
-                        self.toggle_playback();
-                        ui.close_menu();
-                    }
-                    if ui.button("Previous track      ←").clicked() {
-                        self.previous_track();
-                        ui.close_menu();
-                    }
-                    if ui.button("Next track      →").clicked() {
-                        self.next_track();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.checkbox(&mut self.shuffle, "Shuffle").changed() {
-                        self.save_state();
-                    }
-                    ui.menu_button("Repeat", |ui| {
-                        let mut changed = false;
-                        changed |= ui
-                            .selectable_value(&mut self.repeat, RepeatMode::Off, "Off")
-                            .changed();
-                        changed |= ui
-                            .selectable_value(&mut self.repeat, RepeatMode::All, "All")
-                            .changed();
-                        changed |= ui
-                            .selectable_value(&mut self.repeat, RepeatMode::One, "One")
-                            .changed();
-                        if changed {
-                            self.save_state();
-                            ui.close_menu();
-                        }
-                    });
-                });
-                ui.menu_button("View", |ui| {
-                    for (page, label) in [
-                        (Page::Home, "Home"),
-                        (Page::Discover, "Discover"),
-                        (Page::Mixes, "Smart mixes"),
-                        (Page::Songs, "Songs"),
-                        (Page::Albums, "Albums"),
-                        (Page::Artists, "Artists"),
-                        (Page::Playlists, "Playlists"),
-                        (Page::History, "History"),
-                        (Page::Stats, "Listening stats"),
-                        (Page::Settings, "Settings"),
-                    ] {
-                        if ui.selectable_label(self.page == page, label).clicked() {
-                            self.page = page;
-                            if page != Page::Playlists {
-                                self.selected_playlist = None;
+                    ui.menu_button("☰ Menu", |ui| {
+                        ui.menu_button("File", |ui| {
+                            if ui.button("Add music folder…").clicked() {
+                                self.add_folder();
+                                ui.close_menu();
                             }
-                            ui.close_menu();
-                        }
-                    }
-                    if self.lyrics_enabled
-                        && ui
-                            .selectable_label(self.page == Page::Lyrics, "Lyrics")
-                            .clicked()
-                    {
-                        self.page = Page::Lyrics;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Open Now Playing").clicked() {
-                        self.now_playing_expanded = true;
-                        ui.close_menu();
-                    }
+                            if ui.button("Rescan library").clicked() {
+                                self.start_scan();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Quit Lilt").clicked() {
+                                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                            }
+                        });
+                        ui.menu_button("Playback", |ui| {
+                            if ui.button("Play / Pause      Space").clicked() {
+                                self.toggle_playback();
+                                ui.close_menu();
+                            }
+                            if ui.button("Previous track      ←").clicked() {
+                                self.previous_track();
+                                ui.close_menu();
+                            }
+                            if ui.button("Next track      →").clicked() {
+                                self.next_track();
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.checkbox(&mut self.shuffle, "Shuffle").changed() {
+                                self.save_state();
+                            }
+                            ui.menu_button("Repeat", |ui| {
+                                let mut changed = false;
+                                changed |= ui
+                                    .selectable_value(&mut self.repeat, RepeatMode::Off, "Off")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(&mut self.repeat, RepeatMode::All, "All")
+                                    .changed();
+                                changed |= ui
+                                    .selectable_value(&mut self.repeat, RepeatMode::One, "One")
+                                    .changed();
+                                if changed {
+                                    self.save_state();
+                                    ui.close_menu();
+                                }
+                            });
+                        });
+                        ui.menu_button("View", |ui| {
+                            for (page, label) in [
+                                (Page::Home, "Home"),
+                                (Page::Discover, "Discover"),
+                                (Page::Mixes, "Smart mixes"),
+                                (Page::Songs, "Songs"),
+                                (Page::Albums, "Albums"),
+                                (Page::Artists, "Artists"),
+                                (Page::Playlists, "Playlists"),
+                                (Page::History, "History"),
+                                (Page::Stats, "Listening stats"),
+                                (Page::Settings, "Settings"),
+                            ] {
+                                if ui.selectable_label(self.page == page, label).clicked() {
+                                    self.page = page;
+                                    if page != Page::Playlists {
+                                        self.selected_playlist = None;
+                                    }
+                                    ui.close_menu();
+                                }
+                            }
+                            if self.lyrics_enabled
+                                && ui
+                                    .selectable_label(self.page == Page::Lyrics, "Lyrics")
+                                    .clicked()
+                            {
+                                self.page = Page::Lyrics;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if ui.button("Open Now Playing").clicked() {
+                                self.now_playing_expanded = true;
+                                ui.close_menu();
+                            }
+                            if ui
+                                .selectable_label(self.developer_output_open, "Developer Output")
+                                .clicked()
+                            {
+                                self.developer_output_open = !self.developer_output_open;
+                                ui.close_menu();
+                            }
+                            if ui
+                                .button(if self.queue_collapsed {
+                                    "Show Up next"
+                                } else {
+                                    "Hide Up next"
+                                })
+                                .clicked()
+                            {
+                                self.queue_collapsed = !self.queue_collapsed;
+                                self.save_state();
+                                ui.close_menu();
+                            }
+                        });
+                        let playlist_menu_items = self
+                            .playlists
+                            .iter()
+                            .enumerate()
+                            .map(|(index, playlist)| {
+                                (index, playlist.name.clone(), playlist.tracks.len())
+                            })
+                            .collect::<Vec<_>>();
+                        ui.menu_button("Playlists", |ui| {
+                            if ui.button("Open playlist library…").clicked() {
+                                self.page = Page::Playlists;
+                                self.selected_playlist = None;
+                                ui.close_menu();
+                            }
+                            ui.separator();
+                            if playlist_menu_items.is_empty() {
+                                ui.label("No playlists yet");
+                            } else {
+                                egui::ScrollArea::vertical()
+                                    .max_height(320.0)
+                                    .show(ui, |ui| {
+                                        for (index, name, count) in &playlist_menu_items {
+                                            ui.horizontal(|ui| {
+                                                if ui
+                                                    .button(format!("{name} · {count}"))
+                                                    .on_hover_text("Open this playlist")
+                                                    .clicked()
+                                                {
+                                                    self.page = Page::Playlists;
+                                                    self.selected_playlist = Some(*index);
+                                                    ui.close_menu();
+                                                }
+                                                if ui.small_button("Play").clicked() {
+                                                    playlist_menu_action = Some((*index, false));
+                                                    ui.close_menu();
+                                                }
+                                                if ui.small_button("Shuffle").clicked() {
+                                                    playlist_menu_action = Some((*index, true));
+                                                    ui.close_menu();
+                                                }
+                                            });
+                                        }
+                                    });
+                            }
+                        });
+                        ui.menu_button("Help", |ui| {
+                            ui.label(RichText::new("Keyboard shortcuts").strong());
+                            ui.label("Space or Ctrl+P  ·  Play / pause");
+                            ui.label("← / →  ·  Previous / next track");
+                            ui.label("Ctrl+F or /  ·  Search");
+                            ui.separator();
+                            ui.label(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
+                        });
+                    });
+                    ui.add_space(4.0);
+                    ui.add_sized(
+                        [300.0, 34.0],
+                        egui::TextEdit::singleline(&mut self.query)
+                            .id(egui::Id::new("global-search"))
+                            .hint_text("Search songs, artists, albums…"),
+                    );
                     if ui
-                        .selectable_label(self.developer_output_open, "Developer Output")
-                        .clicked()
-                    {
-                        self.developer_output_open = !self.developer_output_open;
-                        ui.close_menu();
-                    }
-                    if ui
-                        .button(if self.queue_collapsed {
-                            "Show Up next"
-                        } else {
-                            "Hide Up next"
-                        })
+                        .selectable_label(
+                            !self.queue_collapsed,
+                            format!("♫ Queue  {}", self.queue.len()),
+                        )
                         .clicked()
                     {
                         self.queue_collapsed = !self.queue_collapsed;
                         self.save_state();
-                        ui.close_menu();
                     }
+                    if ui
+                        .selectable_label(self.page == Page::Settings, "⚙ Settings")
+                        .clicked()
+                    {
+                        self.page = Page::Settings;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .add_sized([42.0, 34.0], egui::Button::new("×"))
+                            .on_hover_text("Close")
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                        let maximized =
+                            ctx.input(|input| input.viewport().maximized.unwrap_or(false));
+                        if ui
+                            .add_sized(
+                                [42.0, 34.0],
+                                egui::Button::new(if maximized { "❐" } else { "□" }),
+                            )
+                            .on_hover_text(if maximized { "Restore" } else { "Maximize" })
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+                        }
+                        if ui
+                            .add_sized([42.0, 34.0], egui::Button::new("—"))
+                            .on_hover_text("Minimize")
+                            .clicked()
+                        {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                        }
+                        ui.separator();
+                        if self.scan_busy {
+                            ui.spinner();
+                            let pulse_phase = ctx.input(|input| input.time) as f32;
+                            let pulse = 0.62 + (pulse_phase * 3.0).sin().abs() * 0.38;
+                            ui.label(
+                                RichText::new(&self.scan_status)
+                                    .small()
+                                    .color(accent.linear_multiply(pulse)),
+                            );
+                        } else {
+                            ui.label(
+                                RichText::new(&self.scan_status)
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                        }
+                    });
                 });
-                let playlist_menu_items = self
-                    .playlists
-                    .iter()
-                    .enumerate()
-                    .map(|(index, playlist)| (index, playlist.name.clone(), playlist.tracks.len()))
-                    .collect::<Vec<_>>();
-                ui.menu_button("Playlists", |ui| {
-                    if ui.button("Open playlist library…").clicked() {
-                        self.page = Page::Playlists;
-                        self.selected_playlist = None;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if playlist_menu_items.is_empty() {
-                        ui.label("No playlists yet");
+                if let Some((index, shuffle)) = playlist_menu_action {
+                    let tracks = self
+                        .playlists
+                        .get(index)
+                        .map(|playlist| self.indices_for_paths(&playlist.tracks))
+                        .unwrap_or_default();
+                    self.page = Page::Playlists;
+                    self.selected_playlist = Some(index);
+                    if tracks.is_empty() {
+                        self.status = "This playlist has no available tracks to play.".into();
+                    } else if shuffle {
+                        self.play_shuffled_indices(tracks);
                     } else {
-                        egui::ScrollArea::vertical()
-                            .max_height(320.0)
-                            .show(ui, |ui| {
-                                for (index, name, count) in &playlist_menu_items {
-                                    ui.horizontal(|ui| {
-                                        if ui
-                                            .button(format!("{name} · {count}"))
-                                            .on_hover_text("Open this playlist")
-                                            .clicked()
-                                        {
-                                            self.page = Page::Playlists;
-                                            self.selected_playlist = Some(*index);
-                                            ui.close_menu();
-                                        }
-                                        if ui.small_button("Play").clicked() {
-                                            playlist_menu_action = Some((*index, false));
-                                            ui.close_menu();
-                                        }
-                                        if ui.small_button("Shuffle").clicked() {
-                                            playlist_menu_action = Some((*index, true));
-                                            ui.close_menu();
-                                        }
-                                    });
-                                }
-                            });
+                        self.play_indices(tracks, 0);
                     }
-                });
-                ui.menu_button("Help", |ui| {
-                    ui.label(RichText::new("Keyboard shortcuts").strong());
-                    ui.label("Space or Ctrl+P  ·  Play / pause");
-                    ui.label("← / →  ·  Previous / next track");
-                    ui.label("Ctrl+F or /  ·  Search");
-                    ui.separator();
-                    ui.label(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
-                });
-                ui.add_space(4.0);
-                ui.add_sized(
-                    [300.0, 34.0],
-                    egui::TextEdit::singleline(&mut self.query)
-                        .id(egui::Id::new("global-search"))
-                        .hint_text("Search songs, artists, albums…"),
-                );
-                if ui
-                    .selectable_label(
-                        !self.queue_collapsed,
-                        format!("♫ Queue  {}", self.queue.len()),
-                    )
-                    .clicked()
-                {
-                    self.queue_collapsed = !self.queue_collapsed;
-                    self.save_state();
                 }
-                if ui
-                    .selectable_label(self.page == Page::Settings, "⚙ Settings")
-                    .clicked()
-                {
-                    self.page = Page::Settings;
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if self.scan_busy {
-                        ui.spinner();
-                        let pulse_phase = ctx.input(|input| input.time) as f32;
-                        let pulse = 0.62 + (pulse_phase * 3.0).sin().abs() * 0.38;
-                        ui.label(
-                            RichText::new(&self.scan_status)
-                                .small()
-                                .color(accent.linear_multiply(pulse)),
-                        );
-                    } else {
-                        ui.label(
-                            RichText::new(&self.scan_status)
-                                .small()
-                                .color(Color32::GRAY),
-                        );
-                    }
-                });
             });
-            if let Some((index, shuffle)) = playlist_menu_action {
-                let tracks = self
-                    .playlists
-                    .get(index)
-                    .map(|playlist| self.indices_for_paths(&playlist.tracks))
-                    .unwrap_or_default();
-                self.page = Page::Playlists;
-                self.selected_playlist = Some(index);
-                if tracks.is_empty() {
-                    self.status = "This playlist has no available tracks to play.".into();
-                } else if shuffle {
-                    self.play_shuffled_indices(tracks);
-                } else {
-                    self.play_indices(tracks, 0);
-                }
-            }
-        });
 
         egui::SidePanel::left("navigation")
             .resizable(false)
@@ -8727,9 +9017,7 @@ impl eframe::App for PlayerApp {
                                     }
                                     #[cfg(target_os = "windows")]
                                     if ui.button("📂  Show in File Explorer").clicked() {
-                                        let _ = std::process::Command::new("explorer.exe")
-                                            .arg(format!("/select,{}", current_path.display()))
-                                            .spawn();
+                                        reveal_path_in_explorer(&current_path);
                                         ui.close_menu();
                                     }
                                     ui.separator();
@@ -9725,6 +10013,8 @@ impl eframe::App for PlayerApp {
                 self.clear_deleted_history_confirmation = false;
             }
         }
+        show_custom_window_resize_grips(ctx);
+        show_splash_overlay(ctx, splash_elapsed);
     }
 }
 
@@ -11414,6 +11704,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_icon(app_icon)
+            .with_decorations(false)
             .with_maximized(start_maximized)
             .with_inner_size([1680.0, 1040.0])
             .with_min_inner_size([1120.0, 720.0]),

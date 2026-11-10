@@ -7,7 +7,7 @@ Native Windows desktop player. It does not need Python or a Python runtime.
 ## Build
 
 Install the stable Rust toolchain with the MSVC target and run `build-release.bat`.
-The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.8-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.8-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
+The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.11-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.11-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
 
 The release script installs WiX Toolset 7 locally if needed. On a fresh setup, read and accept its EULA once by following the [WiX EULA instructions](https://docs.firegiant.com/wix/osmf/) before building the MSI.
 
@@ -39,10 +39,13 @@ The release script installs WiX Toolset 7 locally if needed. On a fresh setup, r
   navigation, and collection actions; playlist menus also support rename and duplicate
 - Windows multimedia keys for play/pause, next, previous, and stop, with current-track metadata
   shared with the system media overlay
+- Show/Reveal in File Explorer opens the track's containing folder and selects the file
 - Redesigned bottom player with clickable album art, clear like/dislike controls, and a seek timeline;
   album art opens the expanded player. Space/Ctrl+P toggles playback and Left/Right changes tracks
   when the app is focused and no text field is active; queued songs advance while unfocused
 - Toolbar and navigation icons load from SVG assets at runtime
+- Custom borderless title bar with `SupremyTommy` credit, grouped app menu, window controls, drag-to-move, and edge resizing
+- Animated startup credit splash for `SupremyTommy`
 - `.lrc` sidecar lyrics display; removing a track from the library preserves its audio file
 - Collaborative artist credits and album-title grouping, with placeholder artist/album metadata omitted
 
