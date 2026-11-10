@@ -77,6 +77,8 @@ enum NowPlayingTab {
     #[default]
     UpNext,
     ForYou,
+    Visualizer,
+    Lyrics,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -166,6 +168,12 @@ struct Preferences {
     show_queue_on_start: bool,
     #[serde(default = "default_compact_mode")]
     compact_mode: bool,
+    #[serde(default = "default_start_maximized")]
+    start_maximized: bool,
+    #[serde(default = "default_animations_enabled")]
+    animations_enabled: bool,
+    #[serde(default)]
+    lyrics_enabled: bool,
 }
 
 impl Default for Preferences {
@@ -201,6 +209,9 @@ impl Default for Preferences {
             daily_mixes: Vec::new(),
             show_queue_on_start: false,
             compact_mode: default_compact_mode(),
+            start_maximized: default_start_maximized(),
+            animations_enabled: default_animations_enabled(),
+            lyrics_enabled: false,
         }
     }
 }
@@ -253,6 +264,14 @@ fn default_compact_mode() -> bool {
     true
 }
 
+fn default_start_maximized() -> bool {
+    true
+}
+
+fn default_animations_enabled() -> bool {
+    true
+}
+
 fn request_repaint_when_focused(context: &egui::Context) {
     if context.input(|input| input.focused) {
         context.request_repaint();
@@ -276,6 +295,8 @@ enum Page {
     Settings,
     ArtistDetail,
     AlbumDetail,
+    Mixes,
+    Stats,
 }
 
 struct ScanResult {
@@ -343,6 +364,16 @@ struct ArtworkResult {
     size: [usize; 2],
     rgba: Option<Vec<u8>>,
 }
+
+#[derive(Clone)]
+struct AiMixCandidate {
+    index: usize,
+    title: String,
+    artist: String,
+    genre: String,
+}
+
+type AiMixMessage = Result<(String, Vec<usize>), String>;
 
 #[derive(Clone, Copy)]
 enum MediaKeyCommand {
@@ -479,6 +510,7 @@ struct PlayerApp {
     selected_artist: Option<String>,
     selected_album: Option<String>,
     settings_draft: Option<Preferences>,
+    settings_advanced: bool,
     pending_delete: Option<(PathBuf, String)>,
     pending_bulk_delete: Option<(Vec<PathBuf>, String)>,
     deleted_songs: Vec<DeletedSongRecord>,
@@ -491,6 +523,9 @@ struct PlayerApp {
     now_playing_expanded: bool,
     now_playing_tab: NowPlayingTab,
     compact_mode: bool,
+    start_maximized: bool,
+    animations_enabled: bool,
+    lyrics_enabled: bool,
     current: Option<usize>,
     playback_offset: Duration,
     sink: Option<Sink>,
@@ -522,6 +557,14 @@ struct PlayerApp {
     artwork_failed: HashSet<PathBuf>,
     media_key_receiver: Receiver<MediaKeyCommand>,
     media_key_sender: Sender<MediaKeyCommand>,
+    ai_mix_prompt: String,
+    ai_mix_results: Vec<usize>,
+    ai_mix_pending: bool,
+    ai_mix_status: String,
+    ai_mix_receiver: Receiver<AiMixMessage>,
+    ai_mix_sender: Sender<AiMixMessage>,
+    google_ai_key_draft: String,
+    google_ai_key_saved: bool,
     #[cfg(target_os = "windows")]
     media_controls: Option<MediaControls>,
     #[cfg(target_os = "windows")]
@@ -538,6 +581,7 @@ impl PlayerApp {
         };
         let (artwork_sender, artwork_receiver) = mpsc::channel();
         let (media_key_sender, media_key_receiver) = mpsc::channel();
+        let (ai_mix_sender, ai_mix_receiver) = mpsc::channel();
         let mut app = Self {
             tracks: Vec::new(),
             folders: preferences.folders,
@@ -600,6 +644,7 @@ impl PlayerApp {
             selected_artist: None,
             selected_album: None,
             settings_draft: None,
+            settings_advanced: false,
             pending_delete: None,
             pending_bulk_delete: None,
             deleted_songs: preferences.deleted_songs,
@@ -612,6 +657,9 @@ impl PlayerApp {
             now_playing_expanded: false,
             now_playing_tab: NowPlayingTab::UpNext,
             compact_mode: preferences.compact_mode,
+            start_maximized: preferences.start_maximized,
+            animations_enabled: preferences.animations_enabled,
+            lyrics_enabled: preferences.lyrics_enabled,
             current: None,
             playback_offset: Duration::ZERO,
             sink: None,
@@ -644,6 +692,14 @@ impl PlayerApp {
             artwork_sender,
             media_key_receiver,
             media_key_sender,
+            ai_mix_prompt: String::new(),
+            ai_mix_results: Vec::new(),
+            ai_mix_pending: false,
+            ai_mix_status: String::new(),
+            ai_mix_receiver,
+            ai_mix_sender,
+            google_ai_key_draft: String::new(),
+            google_ai_key_saved: google_ai_key_exists(),
             #[cfg(target_os = "windows")]
             media_controls: None,
             #[cfg(target_os = "windows")]
@@ -2532,6 +2588,9 @@ impl PlayerApp {
             daily_mixes: self.daily_mix_paths.to_vec(),
             show_queue_on_start: !self.queue_collapsed,
             compact_mode: self.compact_mode,
+            start_maximized: self.start_maximized,
+            animations_enabled: self.animations_enabled,
+            lyrics_enabled: self.lyrics_enabled,
         }
     }
 
@@ -2607,7 +2666,7 @@ impl PlayerApp {
                 .map(|(index, _)| index)
                 .collect(),
             Page::History => self.indices_for_paths(&self.history),
-            Page::Discover => Vec::new(),
+            Page::Discover | Page::Mixes | Page::Stats => Vec::new(),
             Page::Playlists => self
                 .selected_playlist
                 .and_then(|playlist| self.playlists.get(playlist))
@@ -2678,6 +2737,19 @@ impl PlayerApp {
             .collect()
     }
 
+    fn load_lyrics_for(&mut self, track_path: &Path) {
+        match read_lyrics(track_path) {
+            Ok(lyrics) => {
+                self.lyrics = lyrics;
+                self.lyrics_error = None;
+            }
+            Err(error) => {
+                self.lyrics = None;
+                self.lyrics_error = Some(error);
+            }
+        }
+    }
+
     fn play_queue_at(&mut self, queue_position: usize) {
         let Some(&track_index) = self.queue.get(queue_position) else {
             return;
@@ -2688,15 +2760,11 @@ impl PlayerApp {
         let track_path = track.path.clone();
         let track_title = track.title.clone();
         let track_artist = display_credit(&track.artist);
-        match read_lyrics(&track_path) {
-            Ok(lyrics) => {
-                self.lyrics = lyrics;
-                self.lyrics_error = None;
-            }
-            Err(error) => {
-                self.lyrics = None;
-                self.lyrics_error = Some(error);
-            }
+        if self.lyrics_enabled {
+            self.load_lyrics_for(&track_path);
+        } else {
+            self.lyrics = None;
+            self.lyrics_error = None;
         }
         let file = match File::open(&track_path) {
             Ok(file) => file,
@@ -3254,6 +3322,8 @@ impl PlayerApp {
         let mut play_queue_position = None;
         let mut play_recommendation = None;
         let mut add_recommendation = None;
+        let mut queue_again_track = None;
+        let mut queue_again_all = Vec::new();
         let mut play_radio = false;
         let mut add_radio = false;
         let mut like_current = false;
@@ -3273,6 +3343,22 @@ impl PlayerApp {
                     .clicked()
                 {
                     self.now_playing_tab = NowPlayingTab::ForYou;
+                }
+                if ui
+                    .selectable_label(
+                        self.now_playing_tab == NowPlayingTab::Visualizer,
+                        "Visualizer",
+                    )
+                    .clicked()
+                {
+                    self.now_playing_tab = NowPlayingTab::Visualizer;
+                }
+                if self.lyrics_enabled
+                    && ui
+                        .selectable_label(self.now_playing_tab == NowPlayingTab::Lyrics, "Lyrics")
+                        .clicked()
+                {
+                    self.now_playing_tab = NowPlayingTab::Lyrics;
                 }
                 if ui
                     .selectable_label(self.now_playing_tab == NowPlayingTab::UpNext, "Up next")
@@ -3320,12 +3406,13 @@ impl PlayerApp {
                         if ui
                             .add(
                                 egui::Button::image(
-                                    egui::Image::new(if self.liked_songs.contains(&track.path) {
-                                        &self.ui_icons["like"]
-                                    } else {
-                                        &self.ui_icons["like_outline"]
-                                    })
-                                    .fit_to_exact_size(Vec2::splat(22.0)),
+                                    egui::Image::new(&self.ui_icons["like"])
+                                        .tint(if self.liked_songs.contains(&track.path) {
+                                            accent
+                                        } else {
+                                            Color32::from_rgb(166, 171, 184)
+                                        })
+                                        .fit_to_exact_size(Vec2::splat(22.0)),
                                 )
                                 .frame(false),
                             )
@@ -3338,9 +3425,14 @@ impl PlayerApp {
                             .add(
                                 egui::Button::image(
                                     egui::Image::new(&self.ui_icons["dislike"])
+                                        .tint(if self.disliked_songs.contains(&track.path) {
+                                            Color32::from_rgb(255, 89, 100)
+                                        } else {
+                                            Color32::from_rgb(166, 171, 184)
+                                        })
                                         .fit_to_exact_size(Vec2::splat(22.0)),
                                 )
-                                .selected(self.disliked_songs.contains(&track.path)),
+                                .frame(false),
                             )
                             .on_hover_text("Dislike song")
                             .clicked()
@@ -3367,6 +3459,18 @@ impl PlayerApp {
                 .show(&mut columns[1], |ui| match self.now_playing_tab {
                     NowPlayingTab::UpNext => {
                         let start = current_position.unwrap_or(0);
+                        let played_items = self
+                            .queue
+                            .iter()
+                            .enumerate()
+                            .take(start)
+                            .filter_map(|(position, &index)| {
+                                self.tracks
+                                    .get(index)
+                                    .cloned()
+                                    .map(|track| (position, index, track))
+                            })
+                            .collect::<Vec<_>>();
                         let queue_items = self
                             .queue
                             .iter()
@@ -3387,6 +3491,11 @@ impl PlayerApp {
                                     .small()
                                     .color(Color32::GRAY),
                             );
+                            if !played_items.is_empty() && ui.small_button("Queue again").clicked()
+                            {
+                                queue_again_all =
+                                    played_items.iter().map(|(_, index, _)| *index).collect();
+                            }
                         });
                         ui.label(
                             RichText::new("Your queue, followed by music picked for you.")
@@ -3430,15 +3539,17 @@ impl PlayerApp {
                                                     );
                                                 }
                                                 ui.vertical(|ui| {
-                                                    if ui
-                                                        .selectable_label(
-                                                            selected,
-                                                            RichText::new(&track.title).strong(),
-                                                        )
-                                                        .clicked()
-                                                    {
+                                                    let title_response = ui.selectable_label(
+                                                        selected,
+                                                        RichText::new(&track.title).strong(),
+                                                    );
+                                                    if title_response.clicked() {
                                                         play_queue_position = Some(position);
                                                     }
+                                                    self.show_track_context_menu(
+                                                        &title_response,
+                                                        index,
+                                                    );
                                                     ui.label(
                                                         RichText::new(display_credit(
                                                             &track.artist,
@@ -3472,6 +3583,52 @@ impl PlayerApp {
                                             .small()
                                             .color(Color32::GRAY),
                                     );
+                                }
+                                if !played_items.is_empty() {
+                                    ui.add_space(14.0);
+                                    ui.separator();
+                                    ui.horizontal(|ui| {
+                                        ui.heading("Queue again");
+                                        ui.label(
+                                            RichText::new("Previously played")
+                                                .small()
+                                                .color(Color32::GRAY),
+                                        );
+                                    });
+                                    for (position, index, track) in played_items {
+                                        ui.horizontal(|ui| {
+                                            if let Some(texture) =
+                                                self.artwork_texture(ui.ctx(), index)
+                                            {
+                                                ui.add(
+                                                    egui::Image::new(&texture)
+                                                        .fit_to_exact_size(Vec2::splat(38.0))
+                                                        .corner_radius(egui::CornerRadius::same(5)),
+                                                );
+                                            } else {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(38.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                paint_cover_or_placeholder(ui, None, rect, index);
+                                            }
+                                            let response = ui.selectable_label(
+                                                false,
+                                                RichText::new(format!(
+                                                    "{} · {}",
+                                                    track.title,
+                                                    display_credit(&track.artist)
+                                                )),
+                                            );
+                                            if response.clicked() {
+                                                play_queue_position = Some(position);
+                                            }
+                                            self.show_track_context_menu(&response, index);
+                                            if ui.small_button("Queue again").clicked() {
+                                                queue_again_track = Some(index);
+                                            }
+                                        });
+                                    }
                                 }
                             });
                     }
@@ -3546,6 +3703,8 @@ impl PlayerApp {
                                 }
                             });
                     }
+                    NowPlayingTab::Visualizer => self.show_visualizer(ui, current_index),
+                    NowPlayingTab::Lyrics => self.show_expanded_lyrics(ui),
                 });
         });
 
@@ -3565,6 +3724,12 @@ impl PlayerApp {
         if let Some(index) = add_recommendation {
             self.queue_track_next(index);
         }
+        if let Some(index) = queue_again_track {
+            self.queue_track_next(index);
+        }
+        for index in queue_again_all.into_iter().rev() {
+            self.queue_track_next(index);
+        }
         if add_radio {
             self.add_tracks_to_queue(&suggestions);
         }
@@ -3582,12 +3747,370 @@ impl PlayerApp {
         }
     }
 
-    fn show_library(&mut self, ui: &mut egui::Ui) {
-        let page_fade = ui.ctx().animate_bool_with_time(
-            egui::Id::new(("page-fade", self.page as u8)),
-            true,
-            0.22,
+    fn show_visualizer(&self, ui: &mut egui::Ui, current_index: Option<usize>) {
+        ui.heading("Visualizer");
+        ui.label(
+            RichText::new("A gentle animated pulse that follows playback.")
+                .small()
+                .color(Color32::GRAY),
         );
+        ui.add_space(12.0);
+        let (rect, _) = ui.allocate_exact_size(
+            Vec2::new(ui.available_width(), ui.available_height().max(220.0)),
+            egui::Sense::hover(),
+        );
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(12),
+            Color32::from_rgb(11, 13, 20),
+        );
+        let playing = self
+            .sink
+            .as_ref()
+            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
+        let focused = ui.ctx().input(|input| input.focused);
+        let phase = if self.animations_enabled && playing && focused {
+            ui.ctx().input(|input| input.time) as f32
+        } else {
+            0.0
+        };
+        let bars = 48;
+        let gap = 3.0;
+        let bar_width = (rect.width() - gap * (bars as f32 - 1.0)) / bars as f32;
+        let seed = current_index.unwrap_or(0) as f32 * 0.17;
+        for bar in 0..bars {
+            let center_weight = 1.0 - ((bar as f32 / (bars - 1) as f32) - 0.5).abs() * 1.6;
+            let wave = ((phase * 2.6 + bar as f32 * 0.42 + seed).sin() * 0.5 + 0.5) * 0.65 + 0.25;
+            let height =
+                (rect.height() * center_weight.max(0.18) * wave).clamp(10.0, rect.height() - 24.0);
+            let x = rect.left() + bar as f32 * (bar_width + gap);
+            let bar_rect = egui::Rect::from_min_size(
+                egui::pos2(x, rect.center().y - height * 0.5),
+                Vec2::new(bar_width.max(2.0), height),
+            );
+            ui.painter().rect_filled(
+                bar_rect,
+                egui::CornerRadius::same(3),
+                accent_color(&self.accent).linear_multiply(0.45 + wave * 0.55),
+            );
+        }
+        if playing && self.animations_enabled && focused {
+            ui.ctx().request_repaint_after(Duration::from_millis(40));
+        }
+    }
+
+    fn show_expanded_lyrics(&self, ui: &mut egui::Ui) {
+        ui.heading("Lyrics");
+        if let Some(error) = &self.lyrics_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        } else if let Some(lyrics) = &self.lyrics {
+            egui::ScrollArea::vertical()
+                .id_salt("expanded-lyrics")
+                .show(ui, |ui| {
+                    ui.label(RichText::new(lyrics).size(18.0).line_height(Some(28.0)));
+                });
+        } else {
+            ui.label("No .lrc sidecar found for this song.");
+            ui.label(
+                RichText::new("Enable .lrc lyrics in Advanced Settings to use local lyric files.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+        }
+    }
+
+    fn show_smart_mixes(&mut self, ui: &mut egui::Ui) {
+        let recommendations = self.recommendation_indices();
+        let history_paths = self.history.iter().cloned().collect::<HashSet<_>>();
+        let valid = |index: &usize| {
+            self.tracks.get(*index).is_some_and(|track| {
+                !self.excluded_tracks.contains(&track.path)
+                    && !self.disliked_songs.contains(&track.path)
+            })
+        };
+        let for_you = recommendations
+            .iter()
+            .copied()
+            .filter(valid)
+            .collect::<Vec<_>>();
+        let familiar = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| {
+                !self.excluded_tracks.contains(&track.path)
+                    && !self.disliked_songs.contains(&track.path)
+                    && (self.liked_songs.contains(&track.path)
+                        || history_paths.contains(&track.path))
+            })
+            .map(|(index, _)| index)
+            .take(80)
+            .collect::<Vec<_>>();
+        let discovered = recommendations
+            .iter()
+            .copied()
+            .filter(valid)
+            .filter(|&index| {
+                self.tracks.get(index).is_some_and(|track| {
+                    !history_paths.contains(&track.path) && !self.liked_songs.contains(&track.path)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mixes = vec![
+            (
+                "For you".to_string(),
+                "A balanced mix from your likes and listening history.".to_string(),
+                for_you,
+            ),
+            (
+                "Familiar favorites".to_string(),
+                "Songs and artists you return to most.".to_string(),
+                familiar,
+            ),
+            (
+                "Fresh discoveries".to_string(),
+                "Personalized picks you haven't played or liked yet.".to_string(),
+                discovered,
+            ),
+        ];
+        let mut genre_tracks = BTreeMap::<String, Vec<usize>>::new();
+        for &index in &recommendations {
+            if let Some(track) = self.tracks.get(index) {
+                let genre = track.genre.trim();
+                if !genre.is_empty() && valid(&index) {
+                    genre_tracks
+                        .entry(genre.to_string())
+                        .or_default()
+                        .push(index);
+                }
+            }
+        }
+
+        ui.heading(RichText::new("Smart mixes").size(28.0).strong());
+        ui.label(
+            RichText::new(
+                "Local recommendations that adapt to your likes, plays, and music metadata.",
+            )
+            .color(Color32::GRAY),
+        );
+        ui.add_space(12.0);
+        self.show_mix_studio(ui);
+        ui.add_space(18.0);
+        let mut play_mix = None;
+        let mut queue_mix = None;
+        ui.columns(3, |columns| {
+            for (column, (title, description, tracks)) in columns.iter_mut().zip(mixes.iter()) {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(18, 20, 28))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(40, 44, 56)))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .inner_margin(egui::Margin::same(12))
+                    .show(column, |ui| {
+                        let cover = tracks
+                            .first()
+                            .and_then(|&index| self.artwork_texture(ui.ctx(), index));
+                        let (rect, _) = ui.allocate_exact_size(
+                            Vec2::splat(ui.available_width().min(150.0)),
+                            egui::Sense::hover(),
+                        );
+                        paint_cover_or_placeholder(
+                            ui,
+                            cover.as_ref(),
+                            rect,
+                            tracks.first().copied().unwrap_or(0),
+                        );
+                        ui.add_space(8.0);
+                        ui.heading(title);
+                        ui.label(
+                            RichText::new(format!("{} songs", tracks.len()))
+                                .small()
+                                .color(accent_color(&self.accent)),
+                        );
+                        ui.label(RichText::new(description).small().color(Color32::GRAY));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!tracks.is_empty(), egui::Button::new("▶  Play mix"))
+                                .clicked()
+                            {
+                                play_mix = Some(tracks.clone());
+                            }
+                            if ui
+                                .add_enabled(!tracks.is_empty(), egui::Button::new("Add to queue"))
+                                .clicked()
+                            {
+                                queue_mix = Some(tracks.clone());
+                            }
+                        });
+                    });
+            }
+        });
+        if !genre_tracks.is_empty() {
+            ui.add_space(18.0);
+            ui.heading("Genre radios");
+            ui.label(
+                RichText::new("Each radio stays inside the genres in your library.")
+                    .small()
+                    .color(Color32::GRAY),
+            );
+            ui.horizontal_wrapped(|ui| {
+                for (genre, tracks) in genre_tracks.iter().take(12) {
+                    if ui
+                        .add_enabled(
+                            !tracks.is_empty(),
+                            egui::Button::new(format!("♫  {genre} · {} songs", tracks.len())),
+                        )
+                        .clicked()
+                    {
+                        play_mix = Some(tracks.clone());
+                    }
+                }
+            });
+        }
+        if let Some(tracks) = play_mix {
+            self.play_indices(tracks, 0);
+        }
+        if let Some(tracks) = queue_mix {
+            self.add_tracks_to_queue(&tracks);
+        }
+    }
+
+    fn show_mix_studio(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::new()
+            .fill(Color32::from_rgb(21, 23, 34))
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(53, 66, 112)))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::same(14))
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Mix Studio");
+                    ui.label(RichText::new("Optional · Google AI").small().color(Color32::GRAY));
+                });
+                ui.label(RichText::new("Describe a mood or moment. Lilt sends a short prompt and a small set of song labels to make a mix.").small().color(Color32::GRAY));
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.ai_mix_prompt).desired_width(ui.available_width() - 130.0).hint_text("e.g. energetic electronic for a night drive"));
+                    if ui.add_enabled(!self.ai_mix_pending, egui::Button::new(if self.ai_mix_pending { "Making…" } else { "Create mix" })).clicked() {
+                        self.request_ai_mix(ui.ctx());
+                    }
+                });
+                if !self.google_ai_key_saved {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Add your own Google AI key in Settings → Advanced.").small().color(Color32::GRAY));
+                        if ui.small_button("Open settings").clicked() { self.page = Page::Settings; self.settings_advanced = true; }
+                    });
+                }
+                if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
+                if !self.ai_mix_results.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("{} picks", self.ai_mix_results.len()));
+                        if ui.button("▶ Play").clicked() { self.play_indices(self.ai_mix_results.clone(), 0); }
+                        if ui.button("Add to queue").clicked() { self.add_tracks_to_queue(&self.ai_mix_results.clone()); }
+                        if ui.button("Save as playlist").clicked() { self.store_ai_mix_as_playlist(); }
+                    });
+                    egui::ScrollArea::horizontal().id_salt("mix-studio-picks").max_height(88.0).show(ui, |ui| {
+                        for &index in self.ai_mix_results.clone().iter().take(24) {
+                            if let Some(track) = self.tracks.get(index) {
+                                ui.label(RichText::new(format!("{} · {}", track.title, display_credit(&track.artist))).small());
+                            }
+                        }
+                    });
+                }
+            });
+    }
+
+    fn show_listening_stats(&mut self, ui: &mut egui::Ui) {
+        let mut play_counts = HashMap::<PathBuf, usize>::new();
+        for path in &self.history {
+            *play_counts.entry(path.clone()).or_default() += 1;
+        }
+        let track_by_path = self
+            .tracks
+            .iter()
+            .map(|track| (track.path.clone(), track))
+            .collect::<HashMap<_, _>>();
+        let mut top_tracks = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, track)| {
+                play_counts
+                    .get(&track.path)
+                    .copied()
+                    .map(|plays| (plays, index, track.clone()))
+            })
+            .collect::<Vec<_>>();
+        top_tracks.sort_by(|left, right| right.0.cmp(&left.0));
+        let mut artist_counts = HashMap::<String, usize>::new();
+        for (path, count) in &play_counts {
+            if let Some(track) = track_by_path.get(path) {
+                for artist in artist_names(&track.artist) {
+                    *artist_counts.entry(artist).or_default() += *count;
+                }
+            }
+        }
+        let mut top_artists = artist_counts.into_iter().collect::<Vec<_>>();
+        top_artists.sort_by(|left, right| right.1.cmp(&left.1));
+
+        ui.heading(RichText::new("Listening stats").size(28.0).strong());
+        ui.label(
+            RichText::new("A private summary built from listening history stored on this device.")
+                .color(Color32::GRAY),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            for (title, value) in [
+                ("Recorded plays", self.history.len()),
+                ("Songs played", play_counts.len()),
+                ("Liked songs", self.liked_songs.len()),
+                ("Artists followed", self.liked_artists.len()),
+            ] {
+                egui::Frame::new()
+                    .fill(Color32::from_rgb(18, 20, 28))
+                    .corner_radius(egui::CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(18, 12))
+                    .show(ui, |ui| {
+                        ui.label(RichText::new(value.to_string()).size(24.0).strong());
+                        ui.label(RichText::new(title).small().color(Color32::GRAY));
+                    });
+            }
+        });
+        ui.add_space(18.0);
+        let mut play_track = None;
+        ui.columns(2, |columns| {
+            columns[0].heading("Most played songs");
+            for (plays, index, track) in top_tracks.iter().take(10) {
+                let response = columns[0]
+                    .selectable_label(false, format!("{}  ·  {} plays", track.title, plays));
+                if response.clicked() {
+                    play_track = Some(*index);
+                }
+                self.show_track_context_menu(&response, *index);
+            }
+            columns[1].heading("Top artists");
+            for (artist, plays) in top_artists.iter().take(10) {
+                columns[1].label(format!("{artist}  ·  {plays} plays"));
+            }
+        });
+        if top_tracks.is_empty() {
+            ui.add_space(12.0);
+            ui.label("Your play history will build this page as you listen.");
+        }
+        if let Some(index) = play_track {
+            self.play_indices(vec![index], 0);
+        }
+    }
+
+    fn show_library(&mut self, ui: &mut egui::Ui) {
+        let page_fade = if self.animations_enabled {
+            ui.ctx().animate_bool_with_time(
+                egui::Id::new(("page-fade", self.page as u8)),
+                true,
+                0.22,
+            )
+        } else {
+            1.0
+        };
         ui.set_opacity(page_fade);
         let indices = self.page_track_indices();
         let title = match self.page {
@@ -3610,6 +4133,8 @@ impl PlayerApp {
             Page::Disliked => "Disliked".to_string(),
             Page::Lyrics => "Lyrics".to_string(),
             Page::Settings => "Settings".to_string(),
+            Page::Mixes => "Smart mixes".to_string(),
+            Page::Stats => "Listening stats".to_string(),
         };
         if self.page != Page::Home {
             let mut leave_detail = false;
@@ -3628,8 +4153,10 @@ impl PlayerApp {
                         self.home_cache_dirty = true;
                         self.save_state();
                     }
-                    if self.page != Page::Settings
-                        && self.page != Page::Playlists
+                    if !matches!(
+                        self.page,
+                        Page::Settings | Page::Mixes | Page::Stats | Page::Lyrics
+                    ) && self.page != Page::Playlists
                         && self.page != Page::Discover
                     {
                         ui.label(
@@ -3684,6 +4211,8 @@ impl PlayerApp {
                     .show(ui, |ui| self.show_home(ui));
             }
             Page::Discover => self.show_discover(ui),
+            Page::Mixes => self.show_smart_mixes(ui),
+            Page::Stats => self.show_listening_stats(ui),
             Page::Songs | Page::LikedSongs | Page::History | Page::Disliked => {
                 if self.page == Page::Songs {
                     self.show_quick_picks(ui, &indices);
@@ -6372,10 +6901,32 @@ impl PlayerApp {
             .unwrap_or_else(|| self.preferences_snapshot());
         let mut save = false;
         let mut discard = false;
+        ui.horizontal(|ui| {
+            if ui
+                .selectable_label(!self.settings_advanced, "Basic")
+                .clicked()
+            {
+                self.settings_advanced = false;
+            }
+            if ui
+                .selectable_label(self.settings_advanced, "Advanced")
+                .clicked()
+            {
+                self.settings_advanced = true;
+            }
+        });
+        ui.separator();
+        let advanced_settings = self.settings_advanced;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(17, 19, 26))
+            .corner_radius(egui::CornerRadius::same(12))
+            .inner_margin(egui::Margin::symmetric(16, 14))
+            .show(ui, |ui| {
         egui::Grid::new("settings-grid")
             .num_columns(2)
             .spacing([24.0, 18.0])
             .show(ui, |ui| {
+                if !advanced_settings {
                 ui.label(RichText::new("UI scale").strong());
                 ui.horizontal(|ui| {
                     ui.add(
@@ -6391,6 +6942,12 @@ impl PlayerApp {
                 ui.end_row();
                 ui.label(RichText::new("Interface density").strong());
                 ui.checkbox(&mut draft.compact_mode, "Compact controls and spacing");
+                ui.end_row();
+                ui.label(RichText::new("Window startup").strong());
+                ui.checkbox(&mut draft.start_maximized, "Open Lilt maximized");
+                ui.end_row();
+                ui.label(RichText::new("Motion").strong());
+                ui.checkbox(&mut draft.animations_enabled, "Enable smooth transitions and hover effects");
                 ui.end_row();
                 ui.label(RichText::new("Accent color").strong());
                 egui::ComboBox::from_id_salt("accent-color")
@@ -6416,6 +6973,8 @@ impl PlayerApp {
                 ui.label(RichText::new("Artists view").strong());
                 view_mode_combo(ui, "settings-artist-view", &mut draft.artist_view_mode);
                 ui.end_row();
+                }
+                if advanced_settings {
                 ui.label(RichText::new("Recommendations").strong());
                 ui.horizontal(|ui| {
                     ui.label("Familiar");
@@ -6446,6 +7005,8 @@ impl PlayerApp {
                         .suffix(" songs"),
                 );
                 ui.end_row();
+                }
+                if !advanced_settings {
                 ui.label(RichText::new("Playback").strong());
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut draft.shuffle, "Shuffle");
@@ -6469,6 +7030,8 @@ impl PlayerApp {
                         .custom_formatter(|value, _| format!("{:.0}%", value * 100.0)),
                 );
                 ui.end_row();
+                }
+                if advanced_settings {
                 ui.label(RichText::new("Library scan speed").strong());
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -6489,6 +7052,8 @@ impl PlayerApp {
                     );
                 });
                 ui.end_row();
+                }
+                if !advanced_settings {
                 ui.label(RichText::new("Music folders").strong());
                 ui.vertical(|ui| {
                     let mut remove_folder = None;
@@ -6515,6 +7080,8 @@ impl PlayerApp {
                     }
                 });
                 ui.end_row();
+                }
+                if advanced_settings {
                 ui.label(RichText::new("Library removals").strong());
                 ui.horizontal(|ui| {
                     ui.label(format!("{} excluded files", self.excluded_tracks.len()));
@@ -6527,8 +7094,37 @@ impl PlayerApp {
                     }
                 });
                 ui.end_row();
+                ui.label(RichText::new("Lyrics").strong());
+                ui.checkbox(&mut draft.lyrics_enabled, "Enable optional .lrc lyrics support");
+                ui.end_row();
+                }
             });
 
+            if advanced_settings {
+        ui.add_space(14.0);
+        ui.separator();
+        ui.heading("Mix Studio");
+        ui.label(RichText::new("Use your own Google AI key to create a short, personalized mix. The key is stored in Windows Credential Manager. A short theme and up to 48 song titles, artists, and genres are sent to Google; no file paths or audio are sent. Google usage limits and billing may apply.").small().color(Color32::GRAY));
+        ui.horizontal(|ui| {
+            ui.label("Google AI key");
+            ui.add(egui::TextEdit::singleline(&mut self.google_ai_key_draft).password(true).hint_text("Paste your API key"));
+            if ui.button(if self.google_ai_key_saved { "Update key" } else { "Save key" }).clicked() {
+                match write_google_ai_key(&self.google_ai_key_draft) {
+                    Ok(()) => { self.google_ai_key_saved = true; self.google_ai_key_draft.clear(); self.ai_mix_status = "Google AI key saved securely on this device.".into(); }
+                    Err(error) => self.ai_mix_status = error,
+                }
+            }
+            if ui.add_enabled(self.google_ai_key_saved, egui::Button::new("Remove")).clicked() {
+                match delete_google_ai_key() {
+                    Ok(()) => { self.google_ai_key_saved = false; self.google_ai_key_draft.clear(); self.ai_mix_status = "Google AI key removed.".into(); }
+                    Err(error) => self.ai_mix_status = error,
+                }
+            }
+        });
+        ui.hyperlink_to("Get a Google AI key", "https://aistudio.google.com/app/apikey");
+        if !self.ai_mix_status.is_empty() { ui.label(RichText::new(&self.ai_mix_status).small().color(accent_color(&self.accent))); }
+        }
+        if advanced_settings {
         ui.add_space(14.0);
         ui.separator();
         ui.heading("Duplicate detector");
@@ -6764,6 +7360,9 @@ impl PlayerApp {
             }
         }
 
+            }
+        });
+
         self.settings_draft = Some(draft.clone());
         ui.horizontal(|ui| {
             save = ui
@@ -6782,6 +7381,28 @@ impl PlayerApp {
             self.repeat = draft.repeat;
             self.queue_collapsed = !draft.show_queue_on_start;
             self.compact_mode = draft.compact_mode;
+            self.start_maximized = draft.start_maximized;
+            self.animations_enabled = draft.animations_enabled;
+            let lyrics_setting_changed = self.lyrics_enabled != draft.lyrics_enabled;
+            self.lyrics_enabled = draft.lyrics_enabled;
+            if lyrics_setting_changed {
+                if self.lyrics_enabled {
+                    if let Some(path) = self
+                        .current
+                        .and_then(|position| self.queue.get(position))
+                        .and_then(|&index| self.tracks.get(index))
+                        .map(|track| track.path.clone())
+                    {
+                        self.load_lyrics_for(&path);
+                    }
+                } else {
+                    self.lyrics = None;
+                    self.lyrics_error = None;
+                    if self.page == Page::Lyrics {
+                        self.page = Page::Home;
+                    }
+                }
+            }
             self.discovery = draft.discovery;
             self.prefer_unplayed = draft.prefer_unplayed;
             self.recommendation_variety = draft.recommendation_variety.clamp(0.0, 1.0);
@@ -6792,6 +7413,8 @@ impl PlayerApp {
             if let Some(sink) = &self.sink {
                 sink.set_volume(self.volume);
             }
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(self.start_maximized));
             self.recommendations_dirty = true;
             self.home_cache_dirty = true;
             self.settings_draft = None;
@@ -6813,6 +7436,99 @@ impl PlayerApp {
 
     fn compute_recommendations(&self) -> Vec<usize> {
         self.mix_context().compute_recommendations()
+    }
+
+    fn request_ai_mix(&mut self, context: &egui::Context) {
+        if self.ai_mix_pending {
+            return;
+        }
+        let api_key = match read_google_ai_key() {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                self.ai_mix_status = "Add your Google AI key in Settings → Advanced.".into();
+                self.google_ai_key_saved = false;
+                return;
+            }
+            Err(error) => {
+                self.ai_mix_status = error;
+                return;
+            }
+        };
+        let theme = if self.ai_mix_prompt.trim().is_empty() {
+            "a balanced mix based on my music taste".to_string()
+        } else {
+            self.ai_mix_prompt.chars().take(120).collect::<String>()
+        };
+        let mut indices = self.recommendation_indices();
+        indices.extend(0..self.tracks.len());
+        let mut seen = HashSet::new();
+        let candidates = indices
+            .into_iter()
+            .filter(|index| seen.insert(*index))
+            .filter_map(|index| {
+                let track = self.tracks.get(index)?;
+                if self.excluded_tracks.contains(&track.path)
+                    || self.disliked_songs.contains(&track.path)
+                {
+                    return None;
+                }
+                Some(AiMixCandidate {
+                    index,
+                    title: compact_metadata(&track.title, 42),
+                    artist: compact_metadata(&display_credit(&track.artist), 28),
+                    genre: compact_metadata(&track.genre, 20),
+                })
+            })
+            .take(48)
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            self.ai_mix_status = "Add a few songs to your library first.".into();
+            return;
+        }
+
+        self.ai_mix_pending = true;
+        self.ai_mix_status = format!("Making a mix from {} short track labels…", candidates.len());
+        let sender = self.ai_mix_sender.clone();
+        let repaint = context.clone();
+        thread::spawn(move || {
+            let result = generate_google_ai_mix(&api_key, &theme, &candidates);
+            let _ = sender.send(result.map(|indices| (theme, indices)));
+            request_repaint_when_focused(&repaint);
+        });
+    }
+
+    fn poll_ai_mix(&mut self) {
+        while let Ok(result) = self.ai_mix_receiver.try_recv() {
+            self.ai_mix_pending = false;
+            match result {
+                Ok((theme, indices)) => {
+                    self.ai_mix_prompt = theme.clone();
+                    self.ai_mix_results = indices;
+                    self.ai_mix_status =
+                        format!("{} tracks ready for {theme}.", self.ai_mix_results.len());
+                }
+                Err(error) => self.ai_mix_status = error,
+            }
+        }
+    }
+
+    fn store_ai_mix_as_playlist(&mut self) {
+        if self.ai_mix_results.is_empty() {
+            return;
+        }
+        let name = if self.ai_mix_prompt.trim().is_empty() {
+            "Mix Studio playlist".to_string()
+        } else {
+            format!("Mix · {}", self.ai_mix_prompt.trim())
+        };
+        let tracks = self
+            .ai_mix_results
+            .iter()
+            .filter_map(|&index| self.tracks.get(index).map(|track| track.path.clone()))
+            .collect::<Vec<_>>();
+        self.playlists.push(Playlist { name, tracks });
+        self.save_state();
+        self.status = "Saved the Mix Studio picks as a playlist.".into();
     }
 
     fn load_ui_icons(&mut self, context: &egui::Context) {
@@ -6989,6 +7705,7 @@ impl eframe::App for PlayerApp {
             self.poll_duplicate_scan();
             self.poll_artwork(ctx);
             self.poll_media_key_commands();
+            self.poll_ai_mix();
         }
         if !self.artwork_pending.is_empty() {
             if window_focused {
@@ -7187,11 +7904,13 @@ impl eframe::App for PlayerApp {
                     for (page, label) in [
                         (Page::Home, "Home"),
                         (Page::Discover, "Discover"),
+                        (Page::Mixes, "Smart mixes"),
                         (Page::Songs, "Songs"),
                         (Page::Albums, "Albums"),
                         (Page::Artists, "Artists"),
                         (Page::Playlists, "Playlists"),
                         (Page::History, "History"),
+                        (Page::Stats, "Listening stats"),
                         (Page::Settings, "Settings"),
                     ] {
                         if ui.selectable_label(self.page == page, label).clicked() {
@@ -7201,6 +7920,14 @@ impl eframe::App for PlayerApp {
                             }
                             ui.close_menu();
                         }
+                    }
+                    if self.lyrics_enabled
+                        && ui
+                            .selectable_label(self.page == Page::Lyrics, "Lyrics")
+                            .clicked()
+                    {
+                        self.page = Page::Lyrics;
+                        ui.close_menu();
                     }
                     ui.separator();
                     if ui.button("Open Now Playing").clicked() {
@@ -7346,6 +8073,7 @@ impl eframe::App for PlayerApp {
                                 vec![
                                     (Page::Home, "Home", "home"),
                                     (Page::Discover, "Discover", "discover"),
+                                    (Page::Mixes, "Smart mixes", "equalizer"),
                                     (Page::Songs, "Songs", "songs"),
                                     (Page::Albums, "Albums", "album"),
                                     (Page::Artists, "Artists", "person"),
@@ -7363,6 +8091,7 @@ impl eframe::App for PlayerApp {
                                 "ACTIVITY",
                                 vec![
                                     (Page::History, "History", "history"),
+                                    (Page::Stats, "Listening stats", "history"),
                                     (Page::Disliked, "Disliked", "dislike"),
                                     (Page::Lyrics, "Lyrics", "lyrics"),
                                     (Page::Settings, "Settings", "settings"),
@@ -7377,6 +8106,9 @@ impl eframe::App for PlayerApp {
                             );
                             ui.add_space(5.0);
                             for (page, title, icon) in items {
+                                if page == Page::Lyrics && !self.lyrics_enabled {
+                                    continue;
+                                }
                                 if animated_nav_item(
                                     ui,
                                     &format!("{label}-{title}"),
@@ -7888,6 +8620,11 @@ impl eframe::App for PlayerApp {
                     .corner_radius(egui::CornerRadius::same(10))
                     .inner_margin(egui::Margin::symmetric(12, 4))
                     .show(ui, |ui| {
+                        let player_frame_response = ui.interact(
+                            ui.available_rect_before_wrap(),
+                            ui.id().with("expand-player-frame"),
+                            egui::Sense::click(),
+                        );
                         let duration = self
                             .current
                             .and_then(|position| self.queue.get(position))
@@ -7991,16 +8728,13 @@ impl eframe::App for PlayerApp {
                             ));
                             ui.horizontal_centered(|ui| {
                                 let (cover_rect, cover_response) =
-                                    ui.allocate_exact_size(Vec2::splat(48.0), egui::Sense::click());
+                                    ui.allocate_exact_size(Vec2::splat(48.0), egui::Sense::hover());
                                 paint_cover_or_placeholder(
                                     ui,
                                     current_cover.as_ref(),
                                     cover_rect,
                                     current_track_index.unwrap_or(0),
                                 );
-                                if cover_response.clicked() {
-                                    self.now_playing_expanded = !self.now_playing_expanded;
-                                }
                                 cover_response.on_hover_text("Open the expanded player");
                                 ui.vertical(|ui| {
                                     let title = current_track
@@ -8037,11 +8771,17 @@ impl eframe::App for PlayerApp {
                                 }
                                 let playing =
                                     self.sink.as_ref().is_some_and(|sink| !sink.is_paused());
-                                let play_animation = ctx.animate_bool_with_time(
-                                    egui::Id::new("player-play-animation"),
-                                    playing,
-                                    0.18,
-                                );
+                                let play_animation = if self.animations_enabled {
+                                    ctx.animate_bool_with_time(
+                                        egui::Id::new("player-play-animation"),
+                                        playing,
+                                        0.18,
+                                    )
+                                } else if playing {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
                                 if ui
                                     .add(
                                         egui::Button::image(
@@ -8077,12 +8817,13 @@ impl eframe::App for PlayerApp {
                                     .add_enabled(
                                         current_track_index.is_some(),
                                         egui::Button::image(
-                                            egui::Image::new(if current_track_liked {
-                                                &self.ui_icons["like"]
-                                            } else {
-                                                &self.ui_icons["like_outline"]
-                                            })
-                                            .fit_to_exact_size(Vec2::splat(20.0)),
+                                            egui::Image::new(&self.ui_icons["like"])
+                                                .tint(if current_track_liked {
+                                                    accent
+                                                } else {
+                                                    Color32::from_rgb(166, 171, 184)
+                                                })
+                                                .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
                                         .frame(false),
                                     )
@@ -8100,9 +8841,14 @@ impl eframe::App for PlayerApp {
                                         current_track_index.is_some(),
                                         egui::Button::image(
                                             egui::Image::new(&self.ui_icons["dislike"])
+                                                .tint(if current_track_disliked {
+                                                    Color32::from_rgb(255, 89, 100)
+                                                } else {
+                                                    Color32::from_rgb(166, 171, 184)
+                                                })
                                                 .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
-                                        .selected(current_track_disliked),
+                                        .frame(false),
                                     )
                                     .on_hover_text(if current_track_disliked {
                                         "Remove dislike"
@@ -8169,9 +8915,9 @@ impl eframe::App for PlayerApp {
                                 let volume_response = ui
                                     .scope(|ui| {
                                         ui.visuals_mut().selection.bg_fill = accent;
-                                        ui.spacing_mut().slider_rail_height = 3.0;
+                                        ui.spacing_mut().slider_rail_height = 3.5;
                                         ui.add_sized(
-                                            [104.0, 14.0],
+                                            [112.0, 22.0],
                                             egui::Slider::new(&mut self.volume, 0.0..=1.0)
                                                 .show_value(false),
                                         )
@@ -8187,10 +8933,10 @@ impl eframe::App for PlayerApp {
                                 if ui.button("Queue").clicked() {
                                     self.queue_collapsed = !self.queue_collapsed;
                                 }
-                                if ui.button("Expand").clicked() {
-                                    self.now_playing_expanded = true;
-                                }
                             });
+                            if player_frame_response.clicked() {
+                                self.now_playing_expanded = !self.now_playing_expanded;
+                            }
                         });
                         if like_current {
                             if let Some(index) = current_track_index {
@@ -8207,7 +8953,19 @@ impl eframe::App for PlayerApp {
             });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.now_playing_expanded {
+            let player_transition = if self.animations_enabled {
+                ctx.animate_bool_with_time(
+                    egui::Id::new("now-playing-panel-transition"),
+                    self.now_playing_expanded,
+                    0.28,
+                )
+            } else if self.now_playing_expanded {
+                1.0
+            } else {
+                0.0
+            };
+            if self.now_playing_expanded || player_transition > 0.01 {
+                ui.set_opacity(player_transition);
                 self.show_now_playing_view(ui);
             } else {
                 self.show_library(ui);
@@ -9599,6 +10357,280 @@ fn merge_credits<'a>(credits: impl Iterator<Item = &'a str>) -> Vec<String> {
     artists
 }
 
+const GOOGLE_AI_KEY_TARGET: &str = "Lilt.GoogleAI.ApiKey";
+
+fn compact_metadata(value: &str, limit: usize) -> String {
+    value
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .take(limit)
+        .collect()
+}
+
+fn generate_google_ai_mix(
+    key: &str,
+    theme: &str,
+    candidates: &[AiMixCandidate],
+) -> Result<Vec<usize>, String> {
+    let entries = candidates
+        .iter()
+        .enumerate()
+        .map(|(id, candidate)| {
+            serde_json::json!({
+                "id": id,
+                "title": candidate.title,
+                "artist": candidate.artist,
+                "genre": candidate.genre,
+            })
+        })
+        .collect::<Vec<_>>();
+    let prompt = format!("Create a cohesive music mix for this mood: {}. Choose 8 to 20 items from the supplied list, balancing mood and variety. Return only a JSON array of integer ids, no explanation. List: {}", compact_metadata(theme, 120), serde_json::to_string(&entries).unwrap_or_default());
+    let body = serde_json::json!({
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.25, "maxOutputTokens": 64}
+    });
+    let response = google_ai_post(key, &body.to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|_| "Google returned an unreadable response. Try again.".to_string())?;
+    if let Some(message) = value.pointer("error.message").and_then(|v| v.as_str()) {
+        return Err(format!(
+            "Google AI error: {}",
+            compact_metadata(message, 240)
+        ));
+    }
+    let text = value
+        .pointer("candidates.0.content.parts.0.text")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Google returned no mix. Check your key and try again.".to_string())?;
+    let cleaned = text
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    let ids: Vec<usize> = serde_json::from_str(cleaned).map_err(|_| {
+        "Google's response was not a list of song ids. Try a simpler mood.".to_string()
+    })?;
+    let mut seen = HashSet::new();
+    let indices = ids
+        .into_iter()
+        .filter(|id| *id < candidates.len() && seen.insert(*id))
+        .map(|id| candidates[id].index)
+        .collect::<Vec<_>>();
+    if indices.is_empty() {
+        Err("Google did not choose any valid songs. Try again.".into())
+    } else {
+        Ok(indices)
+    }
+}
+
+#[cfg(windows)]
+fn google_ai_key_exists() -> bool {
+    read_google_ai_key().ok().flatten().is_some()
+}
+#[cfg(not(windows))]
+fn google_ai_key_exists() -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn write_google_ai_key(value: &str) -> Result<(), String> {
+    use windows_sys::Win32::Security::Credentials::{
+        CredWriteW, CREDENTIALW, CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Paste a Google AI key first.".into());
+    }
+    if value.len() > 512 || !value.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err("That Google AI key contains invalid characters or is too long.".into());
+    }
+    let target = wide_null(GOOGLE_AI_KEY_TARGET);
+    let username = wide_null("Google AI Studio");
+    let mut credential = CREDENTIALW::default();
+    credential.Type = CRED_TYPE_GENERIC;
+    credential.TargetName = target.as_ptr() as *mut u16;
+    credential.UserName = username.as_ptr() as *mut u16;
+    credential.CredentialBlob = value.as_ptr() as *mut u8;
+    credential.CredentialBlobSize = value.len() as u32;
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    unsafe {
+        if CredWriteW(&credential, 0) == 0 {
+            return Err("Windows could not securely save the Google AI key.".into());
+        }
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn write_google_ai_key(_: &str) -> Result<(), String> {
+    Err("Google AI key storage is supported on Windows only.".into())
+}
+
+#[cfg(windows)]
+fn read_google_ai_key() -> Result<Option<String>, String> {
+    use windows_sys::Win32::Security::Credentials::{
+        CredFree, CredReadW, CREDENTIALW, CRED_TYPE_GENERIC,
+    };
+    let target = wide_null(GOOGLE_AI_KEY_TARGET);
+    let mut pointer: *mut CREDENTIALW = std::ptr::null_mut();
+    unsafe {
+        if CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut pointer) == 0 {
+            return Ok(None);
+        }
+        let credential = &*pointer;
+        let bytes = std::slice::from_raw_parts(
+            credential.CredentialBlob,
+            credential.CredentialBlobSize as usize,
+        );
+        let result = String::from_utf8(bytes.to_vec()).map_err(|_| {
+            "Saved Google AI key is unreadable; remove and save it again.".to_string()
+        });
+        CredFree(pointer.cast());
+        result.map(Some)
+    }
+}
+#[cfg(not(windows))]
+fn read_google_ai_key() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn delete_google_ai_key() -> Result<(), String> {
+    use windows_sys::Win32::Security::Credentials::{CredDeleteW, CRED_TYPE_GENERIC};
+    let target = wide_null(GOOGLE_AI_KEY_TARGET);
+    unsafe {
+        CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0);
+    }
+    Ok(())
+}
+#[cfg(not(windows))]
+fn delete_google_ai_key() -> Result<(), String> {
+    Err("Google AI key storage is supported on Windows only.".into())
+}
+
+#[cfg(windows)]
+fn wide_null(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+#[cfg(windows)]
+fn google_ai_post(key: &str, body: &str) -> Result<String, String> {
+    use std::{ffi::c_void, ptr};
+    use windows_sys::Win32::Networking::WinHttp::*;
+    unsafe {
+        let agent = wide_null("Lilt Player");
+        let session = WinHttpOpen(
+            agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            ptr::null(),
+            ptr::null(),
+            0,
+        );
+        if session.is_null() {
+            return Err("Could not start the secure Google connection.".into());
+        }
+        WinHttpSetTimeouts(session, 10_000, 10_000, 20_000, 30_000);
+        let host = wide_null("generativelanguage.googleapis.com");
+        let connection = WinHttpConnect(session, host.as_ptr(), 443, 0);
+        if connection.is_null() {
+            WinHttpCloseHandle(session);
+            return Err("Could not connect to Google AI.".into());
+        }
+        let path = wide_null("/v1beta/models/gemini-3.5-flash-lite:generateContent");
+        let post = wide_null("POST");
+        let request = WinHttpOpenRequest(
+            connection,
+            post.as_ptr(),
+            path.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            ptr::null(),
+            WINHTTP_FLAG_SECURE,
+        );
+        if request.is_null() {
+            WinHttpCloseHandle(connection);
+            WinHttpCloseHandle(session);
+            return Err("Could not prepare the Google AI request.".into());
+        }
+        let headers = wide_null(&format!(
+            "Content-Type: application/json\r\nx-goog-api-key: {key}\r\n"
+        ));
+        let body_bytes = body.as_bytes();
+        let sent = WinHttpSendRequest(
+            request,
+            headers.as_ptr(),
+            (headers.len() - 1) as u32,
+            body_bytes.as_ptr().cast(),
+            body_bytes.len() as u32,
+            body_bytes.len() as u32,
+            0,
+        ) != 0
+            && WinHttpReceiveResponse(request, ptr::null_mut()) != 0;
+        if !sent {
+            WinHttpCloseHandle(request);
+            WinHttpCloseHandle(connection);
+            WinHttpCloseHandle(session);
+            return Err(
+                "Google AI request failed. Check your internet connection and API key.".into(),
+            );
+        }
+        let mut status: u32 = 0;
+        let mut status_size = std::mem::size_of::<u32>() as u32;
+        WinHttpQueryHeaders(
+            request,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            ptr::null(),
+            (&mut status as *mut u32).cast(),
+            &mut status_size,
+            ptr::null_mut(),
+        );
+        let mut response = Vec::new();
+        loop {
+            let mut available = 0;
+            if WinHttpQueryDataAvailable(request, &mut available) == 0 || available == 0 {
+                break;
+            }
+            let take = available.min(64 * 1024);
+            let start = response.len();
+            response.resize(start + take as usize, 0);
+            let mut read = 0;
+            if WinHttpReadData(
+                request,
+                response[start..].as_mut_ptr().cast::<c_void>(),
+                take,
+                &mut read,
+            ) == 0
+            {
+                response.truncate(start);
+                break;
+            }
+            response.truncate(start + read as usize);
+            if response.len() > 256 * 1024 {
+                break;
+            }
+        }
+        WinHttpCloseHandle(request);
+        WinHttpCloseHandle(connection);
+        WinHttpCloseHandle(session);
+        let text = String::from_utf8_lossy(&response).into_owned();
+        if status >= 400 {
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v.pointer("error.message")
+                        .and_then(|m| m.as_str().map(str::to_string))
+                })
+                .unwrap_or_else(|| format!("Google AI returned HTTP {status}."));
+            return Err(compact_metadata(&message, 220));
+        }
+        Ok(text)
+    }
+}
+#[cfg(not(windows))]
+fn google_ai_post(_: &str, _: &str) -> Result<String, String> {
+    Err("Google AI mix generation is supported on Windows only.".into())
+}
+
 fn display_credit(credit: &str) -> String {
     let artists = artist_names(credit);
     if artists.is_empty() {
@@ -9839,10 +10871,14 @@ fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
 fn main() -> eframe::Result<()> {
     let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app_icon.png"))
         .unwrap_or_default();
+    let start_maximized = load_preferences()
+        .map(|preferences| preferences.start_maximized)
+        .unwrap_or(true);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title(APP_NAME)
             .with_icon(app_icon)
+            .with_maximized(start_maximized)
             .with_inner_size([1680.0, 1040.0])
             .with_min_inner_size([1120.0, 720.0]),
         ..Default::default()

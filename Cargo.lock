@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "lilt-player"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "directories",
  "eframe",
@@ -2134,6 +2134,7 @@ dependencies = [
  "serde",
  "serde_json",
  "souvlaki",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
