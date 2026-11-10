@@ -316,10 +316,14 @@ fn reveal_path_in_explorer(path: &Path) {
         });
 }
 
-const ACCENTS: [(&str, Color32); 3] = [
+const ACCENTS: [(&str, Color32); 7] = [
     ("Blue", Color32::from_rgb(54, 97, 255)),
     ("Sky", Color32::from_rgb(0, 162, 255)),
     ("Ice", Color32::from_rgb(204, 205, 211)),
+    ("Violet", Color32::from_rgb(155, 103, 255)),
+    ("Emerald", Color32::from_rgb(42, 190, 130)),
+    ("Rose", Color32::from_rgb(238, 91, 135)),
+    ("Amber", Color32::from_rgb(235, 165, 55)),
 ];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -535,6 +539,12 @@ struct Preferences {
     lyrics_enabled: bool,
     #[serde(default)]
     default_app_prompt_dismissed: bool,
+    #[serde(default)]
+    fetch_online_artwork: bool,
+    #[serde(default)]
+    online_artwork_prompt_seen: bool,
+    #[serde(default)]
+    developer_console_enabled: bool,
 }
 
 impl Default for Preferences {
@@ -584,6 +594,9 @@ impl Default for Preferences {
             animations_enabled: default_animations_enabled(),
             lyrics_enabled: false,
             default_app_prompt_dismissed: false,
+            fetch_online_artwork: false,
+            online_artwork_prompt_seen: false,
+            developer_console_enabled: false,
         }
     }
 }
@@ -745,6 +758,21 @@ struct ArtworkResult {
     rgba: Option<Vec<u8>>,
 }
 
+struct OnlineArtworkResult {
+    covers: Vec<(Vec<PathBuf>, Option<Arc<Vec<u8>>>)>,
+    artist_covers: Vec<(String, Option<Arc<Vec<u8>>>)>,
+    stage: &'static str,
+    completed: usize,
+    total: usize,
+}
+
+#[derive(Clone)]
+enum SearchSuggestion {
+    Song(usize),
+    Artist(String),
+    Album(String, usize),
+}
+
 #[derive(Clone)]
 struct AiMixCandidate {
     index: usize,
@@ -850,6 +878,20 @@ struct PlayerApp {
     history: Vec<PathBuf>,
     excluded_tracks: HashSet<PathBuf>,
     query: String,
+    search_committed: bool,
+    search_suggestions_open: bool,
+    search_suggestion_selection: usize,
+    search_ai_pending: bool,
+    search_ai_results: Vec<usize>,
+    fetch_online_artwork: bool,
+    online_artwork_prompt_seen: bool,
+    online_artwork_prompt_open: bool,
+    online_artwork_pending: bool,
+    online_artwork_status: String,
+    online_artwork_receiver: Receiver<OnlineArtworkResult>,
+    online_artwork_sender: Sender<OnlineArtworkResult>,
+    artist_artworks: HashMap<String, Arc<Vec<u8>>>,
+    developer_console_enabled: bool,
     page: Page,
     loaded_collection_page: Option<Page>,
     loaded_collection_query: String,
@@ -902,6 +944,7 @@ struct PlayerApp {
     selected_album: Option<String>,
     settings_draft: Option<Preferences>,
     settings_advanced: bool,
+    settings_category: String,
     pending_delete: Option<(PathBuf, String)>,
     pending_bulk_delete: Option<(Vec<PathBuf>, String)>,
     deleted_songs: Vec<DeletedSongRecord>,
@@ -968,6 +1011,9 @@ struct PlayerApp {
     update_available: Option<UpdateInfo>,
     update_downloading: bool,
     update_notice: Option<String>,
+    release_notes_open: bool,
+    last_animated_page: Page,
+    page_animation_started: Instant,
     default_app_prompt_open: bool,
     pending_startup_file: Option<PathBuf>,
     #[cfg(target_os = "windows")]
@@ -1004,6 +1050,7 @@ impl PlayerApp {
         let (artwork_sender, artwork_receiver) = mpsc::channel();
         let (media_key_sender, media_key_receiver) = mpsc::channel();
         let (ai_mix_sender, ai_mix_receiver) = mpsc::channel();
+        let (online_artwork_sender, online_artwork_receiver) = mpsc::channel();
         let (update_sender, update_receiver) = mpsc::channel();
         let update_check_sender = update_sender.clone();
         thread::spawn(move || {
@@ -1021,6 +1068,20 @@ impl PlayerApp {
             history: preferences.history,
             excluded_tracks: preferences.excluded_tracks,
             query: String::new(),
+            search_committed: false,
+            search_suggestions_open: false,
+            search_suggestion_selection: 0,
+            search_ai_pending: false,
+            search_ai_results: Vec::new(),
+            fetch_online_artwork: preferences.fetch_online_artwork,
+            online_artwork_prompt_seen: preferences.online_artwork_prompt_seen,
+            online_artwork_prompt_open: false,
+            online_artwork_pending: false,
+            online_artwork_status: String::new(),
+            online_artwork_receiver,
+            online_artwork_sender,
+            artist_artworks: HashMap::new(),
+            developer_console_enabled: preferences.developer_console_enabled,
             page: Page::Home,
             loaded_collection_page: None,
             loaded_collection_query: String::new(),
@@ -1083,6 +1144,7 @@ impl PlayerApp {
             selected_album: None,
             settings_draft: None,
             settings_advanced: false,
+            settings_category: "Appearance".into(),
             pending_delete: None,
             pending_bulk_delete: None,
             deleted_songs: preferences.deleted_songs,
@@ -1150,6 +1212,9 @@ impl PlayerApp {
             update_available: None,
             update_downloading: false,
             update_notice: None,
+            release_notes_open: false,
+            last_animated_page: Page::Home,
+            page_animation_started: Instant::now(),
             default_app_prompt_open: !preferences.default_app_prompt_dismissed,
             pending_startup_file: startup_file.filter(|file| file.is_file()),
             #[cfg(target_os = "windows")]
@@ -2510,6 +2575,13 @@ impl PlayerApp {
                         );
                     }
                 }
+                if self.tracks.iter().any(|track| track.artwork.is_none()) {
+                    if !self.online_artwork_prompt_seen {
+                        self.online_artwork_prompt_open = true;
+                    } else if self.fetch_online_artwork {
+                        self.start_online_artwork_fetch();
+                    }
+                }
                 if !auto_deleted_set.is_empty() {
                     self.save_state();
                 }
@@ -2639,6 +2711,200 @@ impl PlayerApp {
                 }
             }
             Err(TryRecvError::Empty | TryRecvError::Disconnected) => {}
+        }
+    }
+
+    fn start_online_artwork_fetch(&mut self) {
+        if self.online_artwork_pending {
+            return;
+        }
+        let mut albums = HashMap::<(String, String), (Vec<PathBuf>, String, String)>::new();
+        for track in &self.tracks {
+            if track.artwork.is_some() || is_unknown(&track.album) || is_unknown(&track.artist) {
+                continue;
+            }
+            let key = (track.artist.to_lowercase(), track.album.to_lowercase());
+            let entry = albums
+                .entry(key)
+                .or_insert_with(|| (Vec::new(), track.artist.clone(), track.album.clone()));
+            entry.0.push(track.path.clone());
+        }
+        let jobs = albums.into_values().collect::<Vec<_>>();
+        let mut artist_set = BTreeMap::<String, String>::new();
+        for track in &self.tracks {
+            for artist in artist_names(&track.artist) {
+                artist_set.entry(artist.to_lowercase()).or_insert(artist);
+            }
+        }
+        let artist_jobs = artist_set.into_values().collect::<Vec<_>>();
+        if jobs.is_empty() && artist_jobs.is_empty() {
+            self.online_artwork_status = "No tagged albums or artists need cover art.".into();
+            return;
+        }
+        let total = jobs.len();
+        let artist_total = artist_jobs.len();
+        self.online_artwork_pending = true;
+        self.online_artwork_status =
+            format!("Looking up album and artist covers in the background…");
+        let sender = self.online_artwork_sender.clone();
+        #[cfg(windows)]
+        thread::spawn(move || {
+            let mut batch = Vec::with_capacity(50);
+            for (position, (paths, artist, album)) in jobs.into_iter().enumerate() {
+                let cache_path = online_artwork_cache_path(&artist, &album);
+                let cached = cache_path
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| fs::read(path).ok())
+                    .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES);
+                let bytes = if let Some(cached) = cached {
+                    Some(cached)
+                } else {
+                    let result = lookup_online_album_art(&artist, &album)
+                        .ok()
+                        .filter(|bytes| {
+                            !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES
+                        });
+                    // MusicBrainz requests are globally rate limited per client IP.
+                    thread::sleep(Duration::from_millis(1_050));
+                    result
+                };
+                if let (Some(bytes), Ok(cache_path)) =
+                    (&bytes, online_artwork_cache_path(&artist, &album))
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(cache_path, bytes);
+                }
+                batch.push((paths, bytes.map(Arc::new)));
+                if batch.len() >= 50 || position + 1 == total {
+                    let _ = sender.send(OnlineArtworkResult {
+                        covers: std::mem::take(&mut batch),
+                        artist_covers: Vec::new(),
+                        stage: "albums",
+                        completed: position + 1,
+                        total,
+                    });
+                    batch = Vec::with_capacity(50);
+                }
+            }
+            if total == 0 {
+                let _ = sender.send(OnlineArtworkResult {
+                    covers: Vec::new(),
+                    artist_covers: Vec::new(),
+                    stage: "albums",
+                    completed: 0,
+                    total: 0,
+                });
+            }
+            let mut artist_batch = Vec::with_capacity(50);
+            for (position, artist) in artist_jobs.into_iter().enumerate() {
+                let cache_path = online_artist_art_cache_path(&artist);
+                let cached = cache_path
+                    .as_ref()
+                    .ok()
+                    .and_then(|path| fs::read(path).ok())
+                    .filter(|bytes| !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES);
+                let bytes = if let Some(cached) = cached {
+                    Some(cached)
+                } else {
+                    let result = lookup_online_artist_art(&artist).ok().filter(|bytes| {
+                        !bytes.is_empty() && bytes.len() <= MAX_CACHED_ARTWORK_BYTES
+                    });
+                    thread::sleep(Duration::from_millis(1_050));
+                    result
+                };
+                if let (Some(bytes), Ok(cache_path)) =
+                    (&bytes, online_artist_art_cache_path(&artist))
+                {
+                    if let Some(parent) = cache_path.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    let _ = fs::write(cache_path, bytes);
+                }
+                artist_batch.push((artist, bytes.map(Arc::new)));
+                if artist_batch.len() >= 50 || position + 1 == artist_total {
+                    let _ = sender.send(OnlineArtworkResult {
+                        covers: Vec::new(),
+                        artist_covers: std::mem::take(&mut artist_batch),
+                        stage: "artists",
+                        completed: position + 1,
+                        total: artist_total,
+                    });
+                    artist_batch = Vec::with_capacity(50);
+                }
+            }
+            let _ = sender.send(OnlineArtworkResult {
+                covers: Vec::new(),
+                artist_covers: Vec::new(),
+                stage: "done",
+                completed: 0,
+                total: 0,
+            });
+        });
+        #[cfg(not(windows))]
+        {
+            let _ = (jobs, artist_jobs, sender);
+            self.online_artwork_pending = false;
+            self.online_artwork_status =
+                "Online cover lookup is available in the Windows build.".into();
+        }
+    }
+
+    fn poll_online_artwork(&mut self, context: &egui::Context) {
+        loop {
+            match self.online_artwork_receiver.try_recv() {
+                Ok(result) => {
+                    for (paths, bytes) in result.covers {
+                        if let Some(bytes) = bytes {
+                            for path in &paths {
+                                if let Some(track) =
+                                    self.tracks.iter_mut().find(|track| &track.path == path)
+                                {
+                                    if track.artwork.is_none() {
+                                        track.artwork = Some(Arc::clone(&bytes));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for (artist, bytes) in result.artist_covers {
+                        if let Some(bytes) = bytes {
+                            self.artist_artworks.insert(artist.to_lowercase(), bytes);
+                        }
+                    }
+                    match result.stage {
+                        "albums" => {
+                            self.online_artwork_status = format!(
+                                "Album art lookup · {} / {} albums",
+                                result.completed, result.total
+                            )
+                        }
+                        "artists" => {
+                            self.online_artwork_status = format!(
+                                "Artist cover lookup · {} / {} artists",
+                                result.completed, result.total
+                            )
+                        }
+                        "done" => {
+                            self.online_artwork_pending = false;
+                            self.online_artwork_status =
+                                "Album and artist cover lookup finished.".into();
+                        }
+                        _ => {}
+                    }
+                    context.request_repaint();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    self.online_artwork_pending = false;
+                    break;
+                }
+            }
+        }
+        if self.online_artwork_pending && context.input(|input| input.focused) {
+            context.request_repaint_after(Duration::from_millis(400));
         }
     }
 
@@ -3105,6 +3371,9 @@ impl PlayerApp {
             animations_enabled: self.animations_enabled,
             lyrics_enabled: self.lyrics_enabled,
             default_app_prompt_dismissed: !self.default_app_prompt_open,
+            fetch_online_artwork: self.fetch_online_artwork,
+            online_artwork_prompt_seen: self.online_artwork_prompt_seen,
+            developer_console_enabled: self.developer_console_enabled,
         }
     }
 
@@ -4872,9 +5141,21 @@ impl PlayerApp {
         } else {
             self.selected_album.clone().unwrap_or("Album".into())
         };
-        let cover = tracks
-            .first()
-            .and_then(|&index| self.artwork_texture(ui.ctx(), index));
+        let cover = if is_artist {
+            let selected_artist = self.selected_artist.clone();
+            selected_artist
+                .as_deref()
+                .and_then(|artist| self.artist_artwork_texture(ui.ctx(), artist))
+                .or_else(|| {
+                    tracks
+                        .first()
+                        .and_then(|&index| self.artwork_texture(ui.ctx(), index))
+                })
+        } else {
+            tracks
+                .first()
+                .and_then(|&index| self.artwork_texture(ui.ctx(), index))
+        };
         let mut play_collection = false;
         ui.group(|ui| {
             ui.horizontal(|ui| {
@@ -5721,6 +6002,10 @@ impl PlayerApp {
     }
 
     fn show_home(&mut self, ui: &mut egui::Ui) {
+        if self.search_committed && !self.query.trim().is_empty() {
+            self.show_home_search_results(ui);
+            return;
+        }
         self.drive_home_jobs(ui.ctx());
         if (self.home_job_receiver.is_some() || self.mix_refresh_requested)
             && ui.ctx().input(|input| input.focused)
@@ -6006,6 +6291,513 @@ impl PlayerApp {
                 );
             });
         self.home_cache = Some(home);
+    }
+
+    fn search_matches(&self, query: &str) -> Vec<usize> {
+        let query = query.trim().to_lowercase();
+        let terms = query
+            .split_whitespace()
+            .filter(|term| term.len() > 1)
+            .collect::<Vec<_>>();
+        let mut matches = self
+            .tracks
+            .iter()
+            .enumerate()
+            .filter(|(_, track)| {
+                !self.excluded_tracks.contains(&track.path)
+                    && !self.disliked_songs.contains(&track.path)
+                    && (track.search_text.contains(&query)
+                        || (!terms.is_empty()
+                            && terms.iter().all(|term| track.search_text.contains(term))))
+            })
+            .map(|(index, track)| {
+                let title = track.title.to_lowercase();
+                let artist = track.artist.to_lowercase();
+                let album = track.album.to_lowercase();
+                let all_in = |value: &str| {
+                    !terms.is_empty() && terms.iter().all(|term| value.contains(term))
+                };
+                let rank = if title.starts_with(&query) {
+                    0
+                } else if title.contains(&query) {
+                    1
+                } else if artist.starts_with(&query) || all_in(&artist) {
+                    2
+                } else if album.starts_with(&query) || all_in(&album) {
+                    3
+                } else if all_in(&title) {
+                    4
+                } else {
+                    5
+                };
+                (index, rank, title)
+            })
+            .collect::<Vec<_>>();
+        matches.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.2.cmp(&right.2)));
+        matches.into_iter().map(|(index, _, _)| index).collect()
+    }
+
+    fn show_home_search_results(&mut self, ui: &mut egui::Ui) {
+        let query = self.query.trim().to_owned();
+        let matches = self.search_matches(&query);
+        ui.heading(format!("Search results for ‘{query}’"));
+        ui.label(
+            RichText::new("Songs, artists, and albums from your library").color(Color32::GRAY),
+        );
+        ui.add_space(10.0);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let mut play = None;
+                ui.heading("Songs");
+                if matches.is_empty() {
+                    ui.label("No matching songs in your library.");
+                }
+                for (row, &index) in matches.iter().take(40).enumerate() {
+                    let track = &self.tracks[index];
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("{}  ·  {}  ·  {}", track.title, track.artist, track.album),
+                        )
+                        .clicked()
+                    {
+                        play = Some((index, matches.clone()));
+                    }
+                    if row == 39 {
+                        ui.label("Showing the first 40 matches.");
+                    }
+                }
+                if let Some((index, queue)) = play {
+                    let start = queue.iter().position(|&item| item == index).unwrap_or(0);
+                    self.play_indices(queue, start);
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Artists");
+                let mut artists = self
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, track)| {
+                        !self.excluded_tracks.contains(&track.path)
+                            && track.artist.to_lowercase().contains(&query)
+                    })
+                    .map(|(_, track)| track.artist.trim().to_owned())
+                    .filter(|artist| !artist.is_empty())
+                    .collect::<Vec<_>>();
+                artists.sort_by_key(|artist| artist.to_lowercase());
+                artists.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                let mut artist_open = None;
+                for artist in artists.iter().take(12) {
+                    if ui.button(format!("♫  {artist}")).clicked() {
+                        artist_open = Some(artist.clone());
+                    }
+                }
+                if let Some(artist) = artist_open {
+                    self.selected_artist = Some(artist);
+                    self.page = Page::ArtistDetail;
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Albums");
+                let mut albums = self
+                    .tracks
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, track)| {
+                        !self.excluded_tracks.contains(&track.path)
+                            && track.album.to_lowercase().contains(&query)
+                    })
+                    .map(|(_, track)| track.album.trim().to_owned())
+                    .filter(|album| !album.is_empty())
+                    .collect::<Vec<_>>();
+                albums.sort_by_key(|album| album.to_lowercase());
+                albums.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+                let mut album_open = None;
+                for album in albums.iter().take(12) {
+                    if ui.button(format!("▣  {album}")).clicked() {
+                        album_open = Some(album.clone());
+                    }
+                }
+                if let Some(album) = album_open {
+                    self.selected_album = Some(album);
+                    self.page = Page::AlbumDetail;
+                }
+
+                ui.add_space(12.0);
+                ui.heading("Recommendations");
+                let recommended = if !self.search_ai_results.is_empty() {
+                    self.search_ai_results.clone()
+                } else {
+                    self.recommendation_indices()
+                        .into_iter()
+                        .filter(|&index| {
+                            self.tracks
+                                .get(index)
+                                .is_some_and(|track| track.search_text.contains(&query))
+                        })
+                        .take(5)
+                        .collect::<Vec<_>>()
+                };
+                if recommended.is_empty() {
+                    ui.label(
+                        RichText::new("No additional recommendations for this search yet.")
+                            .color(Color32::GRAY),
+                    );
+                }
+                for &index in &recommended {
+                    let track = &self.tracks[index];
+                    if ui
+                        .button(format!("▶  {}  ·  {}", track.title, track.artist))
+                        .clicked()
+                    {
+                        self.play_indices(
+                            recommended.clone(),
+                            recommended
+                                .iter()
+                                .position(|&item| item == index)
+                                .unwrap_or(0),
+                        );
+                    }
+                }
+            });
+    }
+
+    fn show_search_suggestions(&mut self, ctx: &egui::Context, search_rect: egui::Rect) {
+        let query = self.query.trim().to_owned();
+        let query_terms = query
+            .to_lowercase()
+            .split_whitespace()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        if query.is_empty() {
+            self.search_suggestions_open = false;
+        }
+        let openness = if self.animations_enabled {
+            ctx.animate_bool_with_time_and_easing(
+                egui::Id::new("live-search-suggestions-motion"),
+                self.search_suggestions_open && !query.is_empty(),
+                0.17,
+                egui::emath::easing::quadratic_out,
+            )
+        } else if self.search_suggestions_open && !query.is_empty() {
+            1.0
+        } else {
+            0.0
+        };
+        if openness <= 0.01 {
+            return;
+        }
+        let matches = self.search_matches(&query);
+        let songs = matches.iter().copied().take(5).collect::<Vec<_>>();
+        let mut artists = self
+            .tracks
+            .iter()
+            .filter(|track| {
+                !self.excluded_tracks.contains(&track.path)
+                    && (track.artist.to_lowercase().contains(&query.to_lowercase())
+                        || query_terms
+                            .iter()
+                            .all(|term| track.artist.to_lowercase().contains(term)))
+            })
+            .map(|track| track.artist.trim().to_owned())
+            .filter(|artist| !artist.is_empty())
+            .collect::<Vec<_>>();
+        artists.sort_by_key(|artist| {
+            (
+                !artist.to_lowercase().starts_with(&query.to_lowercase()),
+                artist.to_lowercase(),
+            )
+        });
+        artists.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        artists.truncate(3);
+        let mut albums = self
+            .tracks
+            .iter()
+            .filter(|track| {
+                !self.excluded_tracks.contains(&track.path)
+                    && (track.album.to_lowercase().contains(&query.to_lowercase())
+                        || query_terms
+                            .iter()
+                            .all(|term| track.album.to_lowercase().contains(term)))
+            })
+            .map(|track| track.album.trim().to_owned())
+            .filter(|album| !album.is_empty())
+            .collect::<Vec<_>>();
+        albums.sort_by_key(|album| {
+            (
+                !album.to_lowercase().starts_with(&query.to_lowercase()),
+                album.to_lowercase(),
+            )
+        });
+        albums.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        albums.truncate(3);
+        let artist_first = artists.first().is_some_and(|artist| {
+            let artist = artist.to_lowercase();
+            artist.starts_with(&query.to_lowercase())
+                || query_terms.iter().all(|term| artist.contains(term))
+        });
+        let mut suggestions = Vec::new();
+        if artist_first {
+            if let Some(artist) = artists.first() {
+                suggestions.push(SearchSuggestion::Artist(artist.clone()));
+            }
+            for &index in &songs {
+                if suggestions.len() >= 4 {
+                    break;
+                }
+                if self
+                    .tracks
+                    .get(index)
+                    .is_some_and(|track| track.artist.eq_ignore_ascii_case(artists[0].as_str()))
+                {
+                    suggestions.push(SearchSuggestion::Song(index));
+                }
+            }
+        } else {
+            suggestions.extend(songs.iter().take(3).copied().map(SearchSuggestion::Song));
+            if let Some(artist) = artists.first() {
+                suggestions.push(SearchSuggestion::Artist(artist.clone()));
+            }
+        }
+        if let Some(album) = albums.first() {
+            if let Some(index) = self
+                .tracks
+                .iter()
+                .position(|track| {
+                    track.album.eq_ignore_ascii_case(album) && track.artwork.is_some()
+                })
+                .or_else(|| {
+                    self.tracks
+                        .iter()
+                        .position(|track| track.album.eq_ignore_ascii_case(album))
+                })
+            {
+                if suggestions.len() < 5 {
+                    suggestions.push(SearchSuggestion::Album(album.clone(), index));
+                }
+            }
+        }
+        for &index in &songs {
+            if suggestions.len() >= 5 {
+                break;
+            }
+            if !suggestions.iter().any(|suggestion| matches!(suggestion, SearchSuggestion::Song(existing) if *existing == index)) {
+                suggestions.push(SearchSuggestion::Song(index));
+            }
+        }
+        for artist in artists.iter().skip(1) {
+            if suggestions.len() >= 5 {
+                break;
+            }
+            suggestions.push(SearchSuggestion::Artist(artist.clone()));
+        }
+        for album in albums.iter().skip(1) {
+            if suggestions.len() >= 5 {
+                break;
+            }
+            if let Some(index) = self
+                .tracks
+                .iter()
+                .position(|track| track.album.eq_ignore_ascii_case(album))
+            {
+                suggestions.push(SearchSuggestion::Album(album.clone(), index));
+            }
+        }
+        let keyboard = ctx.input(|input| {
+            (
+                input.key_pressed(egui::Key::ArrowDown),
+                input.key_pressed(egui::Key::ArrowUp),
+                input.key_pressed(egui::Key::Enter),
+                input.key_pressed(egui::Key::Escape),
+                input.pointer.any_pressed(),
+                input.pointer.interact_pos(),
+            )
+        });
+        if keyboard.3 {
+            self.search_suggestions_open = false;
+            return;
+        }
+        if keyboard.4 {
+            if let Some(position) = keyboard
+                .5
+                .filter(|position| !search_rect.contains(*position))
+            {
+                // Keep the dropdown open while interacting with its own rows.
+                let hovering_popup = ctx
+                    .layer_id_at(position)
+                    .is_some_and(|layer| layer.id == egui::Id::new("live-search-suggestions"));
+                if !hovering_popup {
+                    self.search_suggestions_open = false;
+                }
+            }
+        }
+        if keyboard.0 {
+            self.search_suggestion_selection =
+                (self.search_suggestion_selection + 1) % suggestions.len().max(1);
+        }
+        if keyboard.1 {
+            self.search_suggestion_selection = self.search_suggestion_selection.saturating_sub(1);
+        }
+        let mut play = None;
+        let mut artist_open = None;
+        let mut album_open = None;
+        let mut ask_ai = false;
+        let available_height =
+            (ctx.screen_rect().bottom() - search_rect.bottom() - 20.0).clamp(140.0, 640.0);
+        let popup_width = search_rect
+            .width()
+            .max(620.0)
+            .min(ctx.screen_rect().right() - search_rect.left() - 16.0);
+        egui::Area::new(egui::Id::new("live-search-suggestions"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(search_rect.left_bottom() + egui::vec2(0.0, 4.0 - (1.0 - openness) * 10.0))
+            .show(ctx, |ui| {
+                ui.set_opacity(openness);
+                egui::Frame::popup(ui.style())
+                    .fill(Color32::from_rgb(12, 13, 18))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(56, 59, 70)))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .corner_radius(egui::CornerRadius::same(12))
+                    .show(ui, |ui| {
+                        ui.set_min_width(popup_width);
+                        ui.set_max_width(popup_width);
+                        egui::ScrollArea::vertical()
+                            .max_height(available_height)
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if let Some(icon) = self.ui_icons.get("songs") {
+                                        ui.add(
+                                            egui::Image::new(icon)
+                                                .fit_to_exact_size(Vec2::splat(21.0)),
+                                        );
+                                    }
+                                    ui.label(RichText::new("Top matches").size(21.0).strong());
+                                    ui.label(
+                                        RichText::new("Best matches in your library")
+                                            .small()
+                                            .color(Color32::GRAY),
+                                    );
+                                    if self.google_ai_key_saved {
+                                        if ui
+                                            .button(if self.search_ai_pending {
+                                                "Ask AI…"
+                                            } else {
+                                                "✦ Ask AI"
+                                            })
+                                            .clicked()
+                                            && !self.search_ai_pending
+                                        {
+                                            ask_ai = true;
+                                        }
+                                    }
+                                });
+                                if suggestions.is_empty() {
+                                    ui.label(
+                                        RichText::new("No matching songs, artists, or albums")
+                                            .color(Color32::GRAY),
+                                    );
+                                }
+                                for (row, suggestion) in suggestions.iter().enumerate() {
+                                    let selected = row == self.search_suggestion_selection;
+                                    let clicked = match suggestion {
+                                        SearchSuggestion::Song(index) => {
+                                            let cover = self.artwork_texture(ui.ctx(), *index);
+                                            let (title, artist, album) = self.tracks.get(*index)
+                                                .map(|track| (track.title.clone(), track.artist.clone(), track.album.clone()))
+                                                .unwrap_or_default();
+                                            let response = ui.horizontal(|ui| {
+                                                if let Some(texture) = cover {
+                                                    ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(56.0)));
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
+                                                    paint_cover_or_placeholder(ui, None, rect, *index);
+                                                }
+                                                ui.vertical(|ui| {
+                                                    let title_response = ui.selectable_label(selected, RichText::new(&title).size(18.0).strong());
+                                                    ui.label(RichText::new(format!("Song  ·  {}  ·  {}", display_metadata(&artist), display_metadata(&album)))
+                                                        .size(14.0).color(Color32::from_rgb(182, 185, 196)));
+                                                    title_response
+                                                }).inner
+                                            }).inner;
+                                            if response.clicked() { play = Some((*index, songs.clone())); }
+                                            false
+                                        }
+                                        SearchSuggestion::Artist(artist) => {
+                                            let mut open = false;
+                                            ui.horizontal(|ui| {
+                                                if let Some(icon) = self.ui_icons.get("person") {
+                                                    ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(48.0)));
+                                                }
+                                                ui.vertical(|ui| {
+                                                    open = ui.selectable_label(selected, RichText::new(artist).size(18.0).strong()).clicked();
+                                                    ui.label(RichText::new("Artist").size(14.0).color(Color32::from_rgb(182, 185, 196)));
+                                                });
+                                            });
+                                            if open { artist_open = Some(artist.clone()); }
+                                            false
+                                        }
+                                        SearchSuggestion::Album(album, index) => {
+                                            let cover = self.artwork_texture(ui.ctx(), *index);
+                                            let artist = self.tracks.get(*index).map(|track| track.artist.clone()).unwrap_or_default();
+                                            let mut open = false;
+                                            ui.horizontal(|ui| {
+                                                if let Some(texture) = cover {
+                                                    ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(56.0)));
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
+                                                    paint_cover_or_placeholder(ui, None, rect, *index);
+                                                }
+                                                ui.vertical(|ui| {
+                                                    open = ui.selectable_label(selected, RichText::new(album).size(18.0).strong()).clicked();
+                                                    ui.label(RichText::new(format!("Album  ·  {}", display_metadata(&artist))).size(14.0).color(Color32::from_rgb(182, 185, 196)));
+                                                });
+                                            });
+                                            if open { album_open = Some(album.clone()); }
+                                            false
+                                        }
+                                    };
+                                    let _ = clicked;
+                                }
+                                ui.label(
+                                    RichText::new(
+                                        "↑ ↓ navigate · Enter to see all results · Esc close",
+                                    )
+                                    .small()
+                                    .color(Color32::GRAY),
+                                );
+                            });
+                    });
+            });
+        if let Some((index, queue)) = play {
+            self.query = query.clone();
+            self.page = Page::Home;
+            self.search_suggestions_open = false;
+            let start = queue.iter().position(|&item| item == index).unwrap_or(0);
+            self.play_indices(queue, start);
+        }
+        if let Some(artist) = artist_open {
+            self.selected_artist = Some(artist);
+            self.page = Page::ArtistDetail;
+            self.search_suggestions_open = false;
+        }
+        if let Some(album) = album_open {
+            self.selected_album = Some(album);
+            self.page = Page::AlbumDetail;
+            self.search_suggestions_open = false;
+        }
+        if ask_ai {
+            self.search_ai_results.clear();
+            self.search_ai_pending = true;
+            self.search_committed = true;
+            self.ai_mix_prompt = query;
+            self.page = Page::Home;
+            self.request_ai_mix(ctx);
+            if !self.ai_mix_pending {
+                self.search_ai_pending = false;
+            }
+        }
     }
 
     fn home_track_indices(&self) -> Vec<usize> {
@@ -6388,9 +7180,12 @@ impl PlayerApp {
                             let Some((artist, tracks)) = artists.get(position) else {
                                 break;
                             };
-                            let cover = tracks
-                                .first()
-                                .and_then(|&index| self.artwork_texture(ui.ctx(), index));
+                            let cover =
+                                self.artist_artwork_texture(ui.ctx(), artist).or_else(|| {
+                                    tracks
+                                        .first()
+                                        .and_then(|&index| self.artwork_texture(ui.ctx(), index))
+                                });
                             let liked = self.liked_artists.contains(&artist.to_lowercase());
                             let albums = tracks
                                 .iter()
@@ -7536,22 +8331,31 @@ impl PlayerApp {
             .unwrap_or_else(|| self.preferences_snapshot());
         let mut save = false;
         let mut discard = false;
-        ui.horizontal(|ui| {
-            if ui
-                .selectable_label(!self.settings_advanced, "Basic")
-                .clicked()
-            {
-                self.settings_advanced = false;
-            }
-            if ui
-                .selectable_label(self.settings_advanced, "Advanced")
-                .clicked()
-            {
-                self.settings_advanced = true;
+        ui.horizontal_wrapped(|ui| {
+            for category in [
+                "Appearance",
+                "Playback",
+                "Library",
+                "Discover",
+                "AI",
+                "Advanced",
+            ] {
+                if ui
+                    .selectable_label(self.settings_category == category, category)
+                    .clicked()
+                {
+                    self.settings_category = category.to_owned();
+                    self.settings_advanced = matches!(category, "Discover" | "AI" | "Advanced");
+                }
             }
         });
         ui.separator();
-        let advanced_settings = self.settings_advanced;
+        let appearance_settings = self.settings_category == "Appearance";
+        let playback_settings = self.settings_category == "Playback";
+        let library_settings = self.settings_category == "Library";
+        let discover_settings = self.settings_category == "Discover";
+        let ai_settings = self.settings_category == "AI";
+        let advanced_settings = self.settings_category == "Advanced";
         egui::Frame::new()
             .fill(Color32::from_rgb(17, 19, 26))
             .corner_radius(egui::CornerRadius::same(12))
@@ -7561,7 +8365,7 @@ impl PlayerApp {
             .num_columns(2)
             .spacing([24.0, 18.0])
             .show(ui, |ui| {
-                if !advanced_settings {
+                if appearance_settings {
                 ui.label(RichText::new("UI scale").strong());
                 ui.horizontal(|ui| {
                     ui.add(
@@ -7583,6 +8387,9 @@ impl PlayerApp {
                 ui.end_row();
                 ui.label(RichText::new("Motion").strong());
                 ui.checkbox(&mut draft.animations_enabled, "Enable smooth transitions and hover effects");
+                ui.end_row();
+                ui.label(RichText::new("Online artwork").strong());
+                ui.checkbox(&mut draft.fetch_online_artwork, "Fetch missing album and artist covers in the background");
                 ui.end_row();
                 ui.label(RichText::new("Accent color").strong());
                 egui::ComboBox::from_id_salt("accent-color")
@@ -7610,6 +8417,11 @@ impl PlayerApp {
                 ui.end_row();
                 }
                 if advanced_settings {
+                ui.label(RichText::new("Developer console").strong());
+                ui.checkbox(&mut draft.developer_console_enabled, "Enable Developer Output panel");
+                ui.end_row();
+                }
+                if discover_settings {
                 ui.label(RichText::new("Recommendations").strong());
                 ui.horizontal(|ui| {
                     ui.label("Familiar");
@@ -7641,7 +8453,7 @@ impl PlayerApp {
                 );
                 ui.end_row();
                 }
-                if !advanced_settings {
+                if playback_settings {
                 ui.label(RichText::new("Playback").strong());
                 ui.horizontal(|ui| {
                     ui.checkbox(&mut draft.shuffle, "Shuffle");
@@ -7666,7 +8478,7 @@ impl PlayerApp {
                 );
                 ui.end_row();
                 }
-                if advanced_settings {
+                if library_settings {
                 ui.label(RichText::new("Library scan speed").strong());
                 ui.vertical(|ui| {
                     ui.horizontal(|ui| {
@@ -7688,7 +8500,7 @@ impl PlayerApp {
                 });
                 ui.end_row();
                 }
-                if !advanced_settings {
+                if library_settings {
                 ui.label(RichText::new("Music folders").strong());
                 ui.vertical(|ui| {
                     let mut remove_folder = None;
@@ -7716,7 +8528,7 @@ impl PlayerApp {
                 });
                 ui.end_row();
                 }
-                if advanced_settings {
+                if library_settings {
                 ui.label(RichText::new("Library removals").strong());
                 ui.horizontal(|ui| {
                     ui.label(format!("{} excluded files", self.excluded_tracks.len()));
@@ -7735,7 +8547,7 @@ impl PlayerApp {
                 }
             });
 
-            if advanced_settings {
+            if ai_settings {
         ui.add_space(14.0);
         ui.separator();
         ui.heading("Mix Studio");
@@ -7998,6 +8810,20 @@ impl PlayerApp {
             }
         });
 
+        ui.add_space(8.0);
+        ui.label(RichText::new("Online album and artist covers").strong());
+        ui.label(RichText::new("When enabled, Lilt looks up missing album artwork and artist portraits in the background and keeps a local cache. Album searches use MusicBrainz and Cover Art Archive; artist photos use Wikimedia. Only artist and album names are sent to those services.").small().color(Color32::GRAY));
+        ui.label(
+            RichText::new(if !self.online_artwork_status.is_empty() {
+                self.online_artwork_status.as_str()
+            } else if self.fetch_online_artwork {
+                "Background cover lookup is enabled."
+            } else {
+                "Background cover lookup is off."
+            })
+            .small()
+            .color(accent_color(&self.accent)),
+        );
         self.settings_draft = Some(draft.clone());
         ui.horizontal(|ui| {
             save = ui
@@ -8018,7 +8844,19 @@ impl PlayerApp {
             self.compact_mode = draft.compact_mode;
             self.start_maximized = draft.start_maximized;
             self.animations_enabled = draft.animations_enabled;
+            self.developer_console_enabled = draft.developer_console_enabled;
+            if !self.developer_console_enabled {
+                self.developer_output_open = false;
+            }
             let lyrics_setting_changed = self.lyrics_enabled != draft.lyrics_enabled;
+            let artwork_fetch_changed = self.fetch_online_artwork != draft.fetch_online_artwork;
+            self.fetch_online_artwork = draft.fetch_online_artwork;
+            if artwork_fetch_changed {
+                self.online_artwork_prompt_seen = true;
+                if self.fetch_online_artwork {
+                    self.start_online_artwork_fetch();
+                }
+            }
             self.lyrics_enabled = draft.lyrics_enabled;
             if lyrics_setting_changed {
                 if self.lyrics_enabled {
@@ -8167,7 +9005,11 @@ impl PlayerApp {
         let repaint = context.clone();
         let model = self.google_ai_model;
         let thinking = self.google_ai_thinking;
-        let mix_size = self.ai_mix_size;
+        let mix_size = if self.search_ai_pending {
+            5
+        } else {
+            self.ai_mix_size
+        };
         thread::spawn(move || {
             let result =
                 generate_google_ai_mix(&api_key, &theme, &candidates, model, thinking, mix_size);
@@ -8201,7 +9043,16 @@ impl PlayerApp {
                     self.google_ai_requests = self.google_ai_requests.saturating_add(1);
                     self.ai_mix_prompt = theme.clone();
                     self.ai_mix_results = indices.clone();
-                    if self.ai_recommendation_mode {
+                    if self.search_ai_pending {
+                        self.search_ai_results = indices.iter().copied().take(5).collect();
+                        self.search_ai_pending = false;
+                        self.ai_mix_status = format!(
+                            "AI found {} tracks for your search.",
+                            self.search_ai_results.len()
+                        );
+                        self.page = Page::Home;
+                        self.search_suggestions_open = false;
+                    } else if self.ai_recommendation_mode {
                         self.ai_recommendation_indices = indices;
                         self.recommendations_dirty = false;
                         self.ai_mix_status = format!(
@@ -8219,6 +9070,7 @@ impl PlayerApp {
                     self.ai_mix_status = error.clone();
                     self.status = error;
                     self.ai_recommendation_mode = false;
+                    self.search_ai_pending = false;
                 }
             }
         }
@@ -8455,6 +9307,49 @@ impl PlayerApp {
         }
         None
     }
+
+    fn artist_artwork_texture(
+        &mut self,
+        context: &egui::Context,
+        artist: &str,
+    ) -> Option<TextureHandle> {
+        let texture_key = artist_art_texture_key(artist);
+        if let Some(texture) = self.textures.get(&texture_key).cloned() {
+            return Some(texture);
+        }
+        if !context.input(|input| input.focused)
+            || self.artwork_pending.len() >= 4
+            || self.artwork_pending.contains(&texture_key)
+            || self.artwork_failed.contains(&texture_key)
+        {
+            return None;
+        }
+        let bytes = self
+            .artist_artworks
+            .get(&artist.trim().to_lowercase())?
+            .clone();
+        let sender = self.artwork_sender.clone();
+        let request_path = texture_key.clone();
+        self.artwork_pending.insert(texture_key);
+        thread::spawn(move || {
+            let result = image::load_from_memory(bytes.as_slice())
+                .map(|image| image.thumbnail(192, 192).to_rgba8());
+            let (size, rgba) = match result {
+                Ok(decoded) => (
+                    [decoded.width() as usize, decoded.height() as usize],
+                    Some(decoded.into_raw()),
+                ),
+                Err(_) => ([0, 0], None),
+            };
+            let _ = sender.send(ArtworkResult {
+                path: request_path,
+                size,
+                rgba,
+            });
+        });
+        context.request_repaint_after(Duration::from_millis(50));
+        None
+    }
 }
 
 impl eframe::App for PlayerApp {
@@ -8469,6 +9364,7 @@ impl eframe::App for PlayerApp {
             self.poll_home_job();
             self.poll_duplicate_scan();
             self.poll_artwork(ctx);
+            self.poll_online_artwork(ctx);
             self.poll_ai_mix();
         }
         // Windows media-key events arrive through the system media session and
@@ -8489,20 +9385,33 @@ impl eframe::App for PlayerApp {
         self.update_media_session();
         let can_use_shortcuts = !ctx.wants_keyboard_input();
         let shortcuts = ctx.input(|input| {
+            let ctrl = input.modifiers.ctrl;
             (
                 can_use_shortcuts
                     && (input.key_pressed(egui::Key::Space)
-                        || (input.modifiers.ctrl && input.key_pressed(egui::Key::P))),
-                can_use_shortcuts
-                    && (input.key_pressed(egui::Key::ArrowRight)
-                        || (input.modifiers.ctrl && input.key_pressed(egui::Key::ArrowRight))),
-                can_use_shortcuts
-                    && (input.key_pressed(egui::Key::ArrowLeft)
-                        || (input.modifiers.ctrl && input.key_pressed(egui::Key::ArrowLeft))),
-                (input.modifiers.ctrl && input.key_pressed(egui::Key::F))
+                        || (ctrl && input.key_pressed(egui::Key::P))),
+                can_use_shortcuts && input.key_pressed(egui::Key::ArrowRight),
+                can_use_shortcuts && input.key_pressed(egui::Key::ArrowLeft),
+                (ctrl && input.key_pressed(egui::Key::F))
                     || (can_use_shortcuts
                         && !input.modifiers.any()
                         && input.key_pressed(egui::Key::Slash)),
+                ctrl && input.key_pressed(egui::Key::Num1),
+                ctrl && input.key_pressed(egui::Key::Num2),
+                ctrl && input.key_pressed(egui::Key::Num3),
+                ctrl && input.key_pressed(egui::Key::Num4),
+                ctrl && input.key_pressed(egui::Key::Num5),
+                ctrl && input.key_pressed(egui::Key::Num6),
+                ctrl && input.key_pressed(egui::Key::Num7),
+                ctrl && input.key_pressed(egui::Key::Num8),
+                ctrl && input.key_pressed(egui::Key::Num9),
+                ctrl && input.key_pressed(egui::Key::R),
+                ctrl && input.key_pressed(egui::Key::O),
+                ctrl && input.key_pressed(egui::Key::L),
+                ctrl && input.key_pressed(egui::Key::Q),
+                !input.modifiers.any() && input.key_pressed(egui::Key::Escape),
+                input.modifiers.alt && input.key_pressed(egui::Key::ArrowUp),
+                input.modifiers.alt && input.key_pressed(egui::Key::ArrowDown),
             )
         });
         if shortcuts.0 {
@@ -8516,6 +9425,73 @@ impl eframe::App for PlayerApp {
         }
         if shortcuts.3 {
             ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("global-search")));
+            self.search_suggestions_open = !self.query.trim().is_empty();
+        }
+        if shortcuts.4 {
+            self.page = Page::Home;
+        }
+        if shortcuts.5 {
+            self.page = Page::Songs;
+        }
+        if shortcuts.6 {
+            self.page = Page::Albums;
+        }
+        if shortcuts.7 {
+            self.page = Page::Artists;
+        }
+        if shortcuts.8 {
+            self.page = Page::LikedSongs;
+        }
+        if shortcuts.9 {
+            self.page = Page::Playlists;
+        }
+        if shortcuts.10 {
+            self.page = Page::History;
+        }
+        if shortcuts.11 {
+            self.page = Page::Mixes;
+        }
+        if shortcuts.12 {
+            self.page = Page::Settings;
+        }
+        if shortcuts.13 {
+            self.start_scan();
+        }
+        if shortcuts.14 {
+            self.add_folder();
+        }
+        if shortcuts.15 {
+            if let Some(index) = self
+                .current
+                .and_then(|position| self.queue.get(position))
+                .copied()
+            {
+                self.toggle_song_reaction(index, true);
+            }
+        }
+        if shortcuts.16 {
+            self.queue_collapsed = !self.queue_collapsed;
+        }
+        if shortcuts.17 && self.search_suggestions_open {
+            self.search_suggestions_open = false;
+        }
+        if shortcuts.18 {
+            self.volume = (self.volume + 0.05).min(1.0);
+            if let Some(sink) = &self.sink {
+                sink.set_volume(self.volume);
+            }
+            self.save_state();
+        }
+        if shortcuts.19 {
+            self.volume = (self.volume - 0.05).max(0.0);
+            if let Some(sink) = &self.sink {
+                sink.set_volume(self.volume);
+            }
+            self.save_state();
+        }
+        if self.last_animated_page != self.page {
+            self.last_animated_page = self.page;
+            self.page_animation_started = Instant::now();
         }
         ctx.set_zoom_factor(self.ui_scale / 100.0);
         let audio_is_playing = self
@@ -8548,6 +9524,7 @@ impl eframe::App for PlayerApp {
         ctx.set_visuals(egui::Visuals::dark());
         let accent = accent_color(&self.accent);
         ctx.style_mut(|style| {
+            style.animation_time = if self.animations_enabled { 0.16 } else { 0.0 };
             style.visuals.panel_fill = Color32::from_rgb(0, 0, 0);
             style.visuals.window_fill = Color32::from_rgb(19, 19, 19);
             style.visuals.extreme_bg_color = Color32::from_rgb(19, 19, 19);
@@ -8664,11 +9641,14 @@ impl eframe::App for PlayerApp {
             return;
         }
 
+        let mut search_rect = None;
+        let mut search_focused = false;
         egui::TopBottomPanel::top("top-bar")
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(14, 15, 22))
-                    .inner_margin(egui::Margin::symmetric(12, 5)),
+                    .fill(Color32::from_rgb(19, 22, 31))
+                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 55)))
+                    .inner_margin(egui::Margin::symmetric(14, 6)),
             )
             .show(ctx, |ui| {
                 let mut playlist_menu_action = None;
@@ -8691,21 +9671,58 @@ impl eframe::App for PlayerApp {
                             ctx.input(|input| input.viewport().maximized.unwrap_or(false));
                         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
                     }
-                    let drag_width = (ui.available_width() - 900.0).clamp(0.0, 700.0);
-                    if drag_width > 4.0 {
-                        let drag_space = ui.add_sized(
-                            [drag_width, 34.0],
-                            egui::Label::new("").sense(egui::Sense::click_and_drag()),
-                        );
-                        if drag_space.drag_started() {
-                            ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
-                        }
-                        if drag_space.double_clicked() {
-                            let maximized =
-                                ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-                            ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
-                        }
-                    }
+                    if ui.available_width() > 1220.0 {
+                        ui.menu_button("File", |ui| {
+                            if ui.button("Add music folder…").clicked() { self.add_folder(); ui.close_menu(); }
+                            if ui.button("Rescan library").clicked() { self.start_scan(); ui.close_menu(); }
+                            ui.separator();
+                            if ui.button("Quit Lilt").clicked() { ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close); }
+                        });
+                        ui.menu_button("Playback", |ui| {
+                            if ui.button("Play / Pause · Space").clicked() { self.toggle_playback(); ui.close_menu(); }
+                            if ui.button("Previous · ←").clicked() { self.previous_track(); ui.close_menu(); }
+                            if ui.button("Next · →").clicked() { self.next_track(); ui.close_menu(); }
+                            if ui.checkbox(&mut self.shuffle, "Shuffle").changed() { self.save_state(); }
+                            ui.menu_button("Repeat", |ui| {
+                                for (mode, label) in [(RepeatMode::Off,"Off"),(RepeatMode::All,"All"),(RepeatMode::One,"One")] {
+                                    if ui.selectable_value(&mut self.repeat, mode, label).changed() { self.save_state(); }
+                                }
+                            });
+                        });
+                        ui.menu_button("View", |ui| {
+                            for (page, label) in [(Page::Home,"Home"),(Page::Discover,"Discover"),(Page::Mixes,"Smart mixes"),(Page::Songs,"Songs"),(Page::Albums,"Albums"),(Page::Artists,"Artists"),(Page::Playlists,"Playlists"),(Page::History,"History"),(Page::Stats,"Listening stats"),(Page::Settings,"Settings")] {
+                                if ui.selectable_label(self.page == page, label).clicked() { self.page = page; ui.close_menu(); }
+                            }
+                            ui.separator();
+                            if ui.button(if self.now_playing_expanded { "Close Now Playing" } else { "Open Now Playing" }).clicked() { self.now_playing_expanded = !self.now_playing_expanded; ui.close_menu(); }
+                            if self.developer_console_enabled && ui.selectable_label(self.developer_output_open, "Developer Output").clicked() { self.developer_output_open = !self.developer_output_open; ui.close_menu(); }
+                        });
+                        let playlist_items = self.playlists.iter().enumerate().map(|(index, playlist)| (index, playlist.name.clone(), playlist.tracks.len())).collect::<Vec<_>>();
+                        ui.menu_button("Playlists", |ui| {
+                            if ui.button("Open playlist library…").clicked() { self.page = Page::Playlists; self.selected_playlist = None; ui.close_menu(); }
+                            ui.separator();
+                            for (index, name, count) in &playlist_items {
+                                ui.horizontal(|ui| {
+                                    if ui.button(format!("{name} · {count}")).clicked() { self.page = Page::Playlists; self.selected_playlist = Some(*index); ui.close_menu(); }
+                                    if ui.small_button("▶").on_hover_text("Play playlist").clicked() { playlist_menu_action = Some((*index, false)); ui.close_menu(); }
+                                    if ui.small_button("⇄").on_hover_text("Shuffle playlist").clicked() { playlist_menu_action = Some((*index, true)); ui.close_menu(); }
+                                });
+                            }
+                        });
+                        ui.menu_button("Help", |ui| {
+                            if ui.button("What’s new").clicked() { self.release_notes_open = true; ui.close_menu(); }
+                            ui.label(RichText::new("Keyboard shortcuts").strong());
+                            ui.label("Space / Ctrl+P · Play or pause");
+                            ui.label("← / → · Previous or next track");
+                            ui.label("Ctrl+F or / · Search");
+                            ui.label("Tab navigation is always available; ↑ / ↓ moves through live search matches");
+                            ui.label("Ctrl+1…9 · Home, Songs, Albums, Artists, Liked, Playlists, History, Mixes, Settings");
+                            ui.label("Ctrl+R rescan · Ctrl+O add folder · Ctrl+L like · Ctrl+Q queue");
+                            ui.label("Alt+↑ / ↓ · Volume");
+                            ui.separator();
+                            ui.label(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
+                        });
+                    } else {
                     ui.menu_button("☰ Menu", |ui| {
                         ui.menu_button("File", |ui| {
                             if ui.button("Add music folder…").clicked() {
@@ -8789,7 +9806,7 @@ impl eframe::App for PlayerApp {
                                 self.now_playing_expanded = true;
                                 ui.close_menu();
                             }
-                            if ui
+                            if self.developer_console_enabled && ui
                                 .selectable_label(self.developer_output_open, "Developer Output")
                                 .clicked()
                             {
@@ -8855,21 +9872,36 @@ impl eframe::App for PlayerApp {
                             }
                         });
                         ui.menu_button("Help", |ui| {
+                            if ui.button("What’s new").clicked() { self.release_notes_open = true; ui.close_menu(); }
                             ui.label(RichText::new("Keyboard shortcuts").strong());
-                            ui.label("Space or Ctrl+P  ·  Play / pause");
-                            ui.label("← / →  ·  Previous / next track");
-                            ui.label("Ctrl+F or /  ·  Search");
+                            ui.label("Tab navigation is always available; ↑ / ↓ moves through live search matches");
+                            ui.label("Space / Ctrl+P · Play or pause");
+                            ui.label("← / → · Previous or next track");
+                            ui.label("Ctrl+1…9 · Home, Songs, Albums, Artists, Liked, Playlists, History, Mixes, Settings");
+                            ui.label("Ctrl+F or / · Search");
+                            ui.label("Ctrl+R rescan · Ctrl+O add folder · Ctrl+L like · Ctrl+Q queue");
+                            ui.label("Alt+↑ / ↓ · Volume");
                             ui.separator();
                             ui.label(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
                         });
                     });
+                    }
                     ui.add_space(4.0);
-                    ui.add_sized(
-                        [300.0, 34.0],
+                    let search_width = ui.available_width().clamp(170.0, 300.0);
+                    let search_response = ui.add_sized(
+                        [search_width, 34.0],
                         egui::TextEdit::singleline(&mut self.query)
                             .id(egui::Id::new("global-search"))
-                            .hint_text("Search songs, artists, albums…"),
+                            .hint_text("⌕  Search your library…"),
                     );
+                    if search_response.changed() {
+                        self.search_suggestions_open = !self.query.trim().is_empty();
+                        self.search_suggestion_selection = 0;
+                        self.search_ai_results.clear();
+                        self.search_committed = false;
+                    }
+                    search_focused = search_response.has_focus();
+                    search_rect = Some(search_response.rect);
                     if ui
                         .selectable_label(
                             !self.queue_collapsed,
@@ -8914,18 +9946,18 @@ impl eframe::App for PlayerApp {
                             ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
                         }
                         ui.separator();
-                        if self.scan_busy {
+                        if self.scan_busy || self.online_artwork_pending {
                             ui.spinner();
                             let pulse_phase = ctx.input(|input| input.time) as f32;
                             let pulse = 0.62 + (pulse_phase * 3.0).sin().abs() * 0.38;
                             ui.label(
-                                RichText::new(&self.scan_status)
+                                RichText::new(if self.online_artwork_pending { &self.online_artwork_status } else { &self.scan_status })
                                     .small()
                                     .color(accent.linear_multiply(pulse)),
                             );
                         } else {
                             ui.label(
-                                RichText::new(&self.scan_status)
+                                RichText::new(if self.online_artwork_status.is_empty() { &self.scan_status } else { &self.online_artwork_status })
                                     .small()
                                     .color(Color32::GRAY),
                             );
@@ -8949,6 +9981,18 @@ impl eframe::App for PlayerApp {
                     }
                 }
             });
+
+        if let Some(search_rect) = search_rect {
+            self.show_search_suggestions(ctx, search_rect);
+        }
+        if search_focused
+            && ctx.input(|input| input.key_pressed(egui::Key::Enter))
+            && !self.query.trim().is_empty()
+        {
+            self.search_committed = true;
+            self.search_suggestions_open = false;
+            self.page = Page::Home;
+        }
 
         egui::SidePanel::left("navigation")
             .resizable(false)
@@ -9888,6 +10932,15 @@ impl eframe::App for PlayerApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            let page_progress = if self.animations_enabled {
+                (self.page_animation_started.elapsed().as_secs_f32() / 0.21).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let page_ease = 1.0 - (1.0 - page_progress).powi(3);
+            if page_progress < 1.0 {
+                ctx.request_repaint_after(Duration::from_millis(16));
+            }
             let player_transition = if self.animations_enabled {
                 ctx.animate_bool_with_time(
                     egui::Id::new("now-playing-panel-transition"),
@@ -9903,6 +10956,8 @@ impl eframe::App for PlayerApp {
                 ui.set_opacity(player_transition);
                 self.show_now_playing_view(ui);
             } else {
+                ui.set_opacity(page_ease);
+                ui.add_space((1.0 - page_ease) * 14.0);
                 self.show_library(ui);
             }
         });
@@ -9928,7 +10983,9 @@ impl eframe::App for PlayerApp {
                                                 .color(Color32::from_rgb(255, 135, 140)),
                                         );
                                         ui.label(message);
-                                        if ui.small_button("Open Developer Output").clicked() {
+                                        if self.developer_console_enabled
+                                            && ui.small_button("Open Developer Output").clicked()
+                                        {
                                             self.developer_output_open = true;
                                         }
                                     });
@@ -9945,6 +11002,57 @@ impl eframe::App for PlayerApp {
         }
 
         self.show_properties_window(ctx);
+
+        if self.online_artwork_prompt_open {
+            let mut enable = false;
+            let mut skip = false;
+            egui::Window::new("Find missing album covers?")
+                .id(egui::Id::new("online-artwork-opt-in"))
+                .collapsible(false).resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+                .show(ctx, |ui| {
+                    ui.label("Lilt can look up missing cover art online after scanning your library.");
+                    ui.label(RichText::new("Lookups run slowly in the background, use MusicBrainz and Cover Art Archive, and are cached on this device. Track names and artist / album metadata are sent to find a match.").small().color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        enable = ui.add_sized([190.0, 38.0], egui::Button::new("Fetch in background")).clicked();
+                        skip = ui.button("Not now").clicked();
+                    });
+                });
+            if enable {
+                self.fetch_online_artwork = true;
+                self.online_artwork_prompt_seen = true;
+                self.online_artwork_prompt_open = false;
+                self.save_state();
+                self.start_online_artwork_fetch();
+            } else if skip {
+                self.fetch_online_artwork = false;
+                self.online_artwork_prompt_seen = true;
+                self.online_artwork_prompt_open = false;
+                self.save_state();
+            }
+        }
+
+        if self.release_notes_open {
+            let mut open = true;
+            egui::Window::new("What’s new in Lilt")
+                .id(egui::Id::new("release-notes"))
+                .open(&mut open).collapsible(false).resizable(true)
+                .default_width(460.0).default_height(360.0)
+                .show(ctx, |ui| {
+                    ui.heading(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
+                    ui.label(RichText::new("Release notes").color(Color32::GRAY));
+                    ui.separator();
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.heading("Search");
+                        ui.label("Live search suggestions show matching songs, artists, and albums while you type. Ask AI can suggest up to five tracks from your local library when a Google AI key is configured.");
+                        ui.heading("Navigation");
+                        ui.label("The top bar restores individual menus when there is room and keeps them grouped on narrower windows. Keyboard shortcuts are available in Help.");
+                        ui.heading("Album art");
+                        ui.label("You can opt in to background cover lookup after scanning, or enable it later in Settings. Lookups are cached locally.");
+                    });
+                });
+            self.release_notes_open = open;
+        }
 
         if self.default_app_prompt_open {
             let mut open_settings = false;
@@ -11210,6 +12318,8 @@ fn scan_folders_with_settings(
         for _ in 0..worker_count {
             scope.spawn(|| {
                 let mut artwork_cache = HashMap::<u64, Vec<Arc<Vec<u8>>>>::new();
+                let mut online_cover_cache =
+                    HashMap::<(String, String), Option<Arc<Vec<u8>>>>::new();
                 let mut local = Vec::new();
                 loop {
                     let position = next_path.fetch_add(1, Ordering::Relaxed);
@@ -11228,7 +12338,11 @@ fn scan_folders_with_settings(
                         window.1 += 1;
                     }
                     scan_progress.fetch_add(1, Ordering::Relaxed);
-                    local.push(read_track(path.clone(), &mut artwork_cache));
+                    local.push(read_track(
+                        path.clone(),
+                        &mut artwork_cache,
+                        &mut online_cover_cache,
+                    ));
                 }
                 collected
                     .lock()
@@ -11288,7 +12402,11 @@ fn scan_folders_with_settings(
     }
 }
 
-fn read_track(path: PathBuf, artwork_cache: &mut HashMap<u64, Vec<Arc<Vec<u8>>>>) -> Track {
+fn read_track(
+    path: PathBuf,
+    artwork_cache: &mut HashMap<u64, Vec<Arc<Vec<u8>>>>,
+    online_cover_cache: &mut HashMap<(String, String), Option<Arc<Vec<u8>>>>,
+) -> Track {
     let fallback_title = path
         .file_stem()
         .and_then(|name| name.to_str())
@@ -11333,12 +12451,125 @@ fn read_track(path: PathBuf, artwork_cache: &mut HashMap<u64, Vec<Arc<Vec<u8>>>>
             });
         }
     }
+    if track.artwork.is_none() && !is_unknown(&track.album) && !is_unknown(&track.artist) {
+        let key = (track.artist.to_lowercase(), track.album.to_lowercase());
+        let cached = online_cover_cache.entry(key).or_insert_with(|| {
+            let path = online_artwork_cache_path(&track.artist, &track.album).ok()?;
+            let bytes = fs::read(path).ok()?;
+            if bytes.is_empty() || bytes.len() > MAX_CACHED_ARTWORK_BYTES {
+                return None;
+            }
+            Some(Arc::new(bytes))
+        });
+        track.artwork = cached.clone();
+    }
     track.search_text = format!(
         "{} {} {} {}",
         track.title, track.artist, track.album, track.genre
     )
     .to_lowercase();
     track
+}
+
+fn online_artwork_cache_path(artist: &str, album: &str) -> Result<PathBuf, String> {
+    let project = ProjectDirs::from("com", "Lilt", "Lilt Player")
+        .ok_or_else(|| "Could not locate the local album-art cache directory.".to_string())?;
+    let mut hasher = DefaultHasher::new();
+    artist.trim().to_lowercase().hash(&mut hasher);
+    album.trim().to_lowercase().hash(&mut hasher);
+    Ok(project
+        .data_local_dir()
+        .join("album-art")
+        .join(format!("{:016x}.jpg", hasher.finish())))
+}
+
+fn artist_art_cache_key(artist: &str) -> String {
+    let mut hasher = DefaultHasher::new();
+    artist.trim().to_lowercase().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+fn online_artist_art_cache_path(artist: &str) -> Result<PathBuf, String> {
+    let project = ProjectDirs::from("com", "Lilt", "Lilt Player")
+        .ok_or_else(|| "Could not locate the local artist-art cache directory.".to_string())?;
+    Ok(project
+        .data_local_dir()
+        .join("artist-art")
+        .join(format!("{}.jpg", artist_art_cache_key(artist))))
+}
+
+fn artist_art_texture_key(artist: &str) -> PathBuf {
+    PathBuf::from("__lilt_artist_art__").join(format!("{}.jpg", artist_art_cache_key(artist)))
+}
+
+#[cfg(windows)]
+fn lookup_online_album_art(artist: &str, album: &str) -> Result<Vec<u8>, String> {
+    let query = format!(
+        "releasegroup:\"{}\" AND artist:\"{}\"",
+        album.trim(),
+        artist.trim()
+    );
+    let search_path = format!(
+        "/ws/2/release-group/?query={}&fmt=json&limit=1",
+        url_encode_component(&query)
+    );
+    let response = winhttp_get(
+        "musicbrainz.org",
+        &search_path,
+        "application/json",
+        512 * 1024,
+    )?;
+    let value: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|_| "MusicBrainz returned invalid album metadata.".to_string())?;
+    let id = value
+        .pointer("/release-groups/0/id")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "No matching album cover was found.".to_string())?;
+    winhttp_get(
+        "coverartarchive.org",
+        &format!("/release-group/{id}/front-250"),
+        "image/jpeg,image/png,image/webp",
+        MAX_CACHED_ARTWORK_BYTES,
+    )
+}
+
+#[cfg(windows)]
+fn lookup_online_artist_art(artist: &str) -> Result<Vec<u8>, String> {
+    let path = format!("/w/api.php?action=query&format=json&formatversion=2&generator=search&gsrsearch={}&gsrnamespace=0&gsrlimit=1&prop=pageimages&piprop=thumbnail&pithumbsize=400&pilimit=1", url_encode_component(artist.trim()));
+    let response = winhttp_get("en.wikipedia.org", &path, "application/json", 512 * 1024)?;
+    let value: serde_json::Value = serde_json::from_slice(&response)
+        .map_err(|_| "Wikipedia returned invalid artist image metadata.".to_string())?;
+    let source = value
+        .pointer("/query/pages/0/thumbnail/source")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "No artist image was found.".to_string())?;
+    let source = source
+        .strip_prefix("https://")
+        .ok_or_else(|| "The artist image URL was not secure.".to_string())?;
+    let (host, path) = source
+        .split_once('/')
+        .ok_or_else(|| "The artist image URL was invalid.".to_string())?;
+    if !host.ends_with("wikimedia.org") {
+        return Err("Wikipedia returned an unexpected artist image host.".into());
+    }
+    winhttp_get(
+        host,
+        &format!("/{path}"),
+        "image/jpeg,image/png",
+        MAX_CACHED_ARTWORK_BYTES,
+    )
+}
+
+fn url_encode_component(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 fn read_lyrics(track_path: &Path) -> Result<Option<String>, String> {
@@ -11411,6 +12642,11 @@ fn merge_credits<'a>(credits: impl Iterator<Item = &'a str>) -> Vec<String> {
 }
 
 const GOOGLE_AI_KEY_TARGET: &str = "Lilt.GoogleAI.ApiKey";
+const LILT_USER_AGENT: &str = concat!(
+    "LiltPlayer/",
+    env!("CARGO_PKG_VERSION"),
+    " (https://github.com/ultimatebloxstudium-tech/Lilt)"
+);
 
 fn compact_metadata(value: &str, limit: usize) -> String {
     value
@@ -11763,7 +12999,7 @@ fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result
     use std::{ffi::c_void, ptr};
     use windows_sys::Win32::Networking::WinHttp::*;
     unsafe {
-        let agent = wide_null("Lilt Player");
+        let agent = wide_null(LILT_USER_AGENT);
         let session = WinHttpOpen(
             agent.as_ptr(),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
@@ -11772,14 +13008,14 @@ fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result
             0,
         );
         if session.is_null() {
-            return Err("Could not start the secure update connection.".into());
+            return Err("Could not start the secure internet connection.".into());
         }
         WinHttpSetTimeouts(session, 10_000, 10_000, 20_000, 60_000);
         let host_w = wide_null(host);
         let connection = WinHttpConnect(session, host_w.as_ptr(), 443, 0);
         if connection.is_null() {
             WinHttpCloseHandle(session);
-            return Err("Could not connect to GitHub.".into());
+            return Err(format!("Could not connect to {host}."));
         }
         let path_w = wide_null(path);
         let get = wide_null("GET");
@@ -11795,10 +13031,10 @@ fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result
         if request.is_null() {
             WinHttpCloseHandle(connection);
             WinHttpCloseHandle(session);
-            return Err("Could not prepare the GitHub request.".into());
+            return Err(format!("Could not prepare a request to {host}."));
         }
         let headers = wide_null(&format!(
-            "Accept: {accept}\r\nUser-Agent: Lilt Player\r\nX-GitHub-Api-Version: 2022-11-28\r\n"
+            "Accept: {accept}\r\nUser-Agent: {LILT_USER_AGENT}\r\nX-GitHub-Api-Version: 2022-11-28\r\n"
         ));
         let ok = WinHttpSendRequest(
             request,
@@ -11812,7 +13048,9 @@ fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result
             && WinHttpReceiveResponse(request, ptr::null_mut()) != 0;
         let mut result = Ok(Vec::new());
         if !ok {
-            result = Err("GitHub update request failed; check your internet connection.".into());
+            result = Err(format!(
+                "The request to {host} failed; check your internet connection."
+            ));
         } else {
             let mut status = 0u32;
             let mut status_size = std::mem::size_of::<u32>() as u32;
@@ -11825,9 +13063,7 @@ fn winhttp_get(host: &str, path: &str, accept: &str, max_bytes: usize) -> Result
                 ptr::null_mut(),
             );
             if status != 200 {
-                result = Err(format!(
-                    "GitHub returned HTTP {status} while checking or downloading the update."
-                ));
+                result = Err(format!("{host} returned HTTP {status}."));
             } else {
                 let mut body = Vec::new();
                 loop {
@@ -11876,7 +13112,7 @@ fn google_ai_post(key: &str, body: &str, model: GeminiModel) -> Result<String, S
     use std::{ffi::c_void, ptr};
     use windows_sys::Win32::Networking::WinHttp::*;
     unsafe {
-        let agent = wide_null("Lilt Player");
+        let agent = wide_null(LILT_USER_AGENT);
         let session = WinHttpOpen(
             agent.as_ptr(),
             WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,

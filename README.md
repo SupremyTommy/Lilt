@@ -16,16 +16,19 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
 ## Current features
 
 - Background folder scanning, metadata, embedded album artwork, and library search
+- Optional missing album-cover and artist-portrait lookup through MusicBrainz/Cover Art Archive and Wikimedia. It runs in the background, updates progress every 50 items, and caches results locally. Album lookup applies to supported audio files with artist/album metadata.
+- Live typed search suggestions show at most five mixed song, artist, and album results with cover art; artist-name queries prioritize artist matches. Enter opens grouped Songs, Artists, Albums, and Recommendations results
+- Optional Ask AI search action uses a configured Google AI key to select up to five matching local tracks
 - Home and Discover pages with personalized recommendations, genre and decade mixes, and artist radio
-- File, Playback, View, Help, and Playlists menus; playlists remain available in the sidebar
+- Responsive File, Playback, View, Help, and Playlists menus in the title bar, with a grouped overflow menu on narrower windows; playlists remain available in the sidebar
 - Larger YouTube Music-inspired layout with Songs, Albums, Artists, Likes, Playlists,
   History, Disliked, Lyrics, and Settings navigation
-- Grid, details, and list views; customizable accent, discovery balance, recommendation variety and
+- Grid, details, and list views; Settings are grouped into Appearance, Playback, Library, Discover, AI, and Advanced sections, with Blue, Sky, Ice, Violet, Emerald, Rose, and Amber accent themes; customizable discovery balance, recommendation variety and
   size, unplayed-song priority, and library folders
 - Persistent song likes/dislikes, followed artists, saved albums, playlists, history, and preferences
 - Home Recommendations and New to you shelves personalized from liked music and listening history,
   with controls for discovery balance, unplayed-song priority, variety, and mix size
-- Queue panel with reordering, play/pause/next/previous, keyboard shortcuts, shuffle, and repeat;
+- Queue panel with reordering, play/pause/next/previous, always-available keyboard navigation, broad shortcuts, shuffle, and repeat;
   album and artist collection shuffle randomizes the complete collection
 - Expanded Now Playing view with album art, Up next, contextual For you picks, and one-click radio
   playback built from your library, listening history, likes, and current track
@@ -36,7 +39,7 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
 - Mix Studio includes saved Liked, Played, and Unplayed library filters, full-library compact metadata,
   in-page model, thinking, mix-size, and opt-in recommendation controls, plus
   per-request and total token usage reported by Google; account quota links to Google AI Studio
-- Developer Output panel and temporary error notifications for app status and troubleshooting
+- Optional Developer Output panel (off by default) and temporary error notifications for app status and troubleshooting
 - Right-click track, album, artist, Home mix, or playlist items for playback, queueing, library,
   navigation, and collection actions; playlist menus also support rename and duplicate
 - Windows multimedia keys for play/pause, next, previous, and stop, with current-track metadata
@@ -46,7 +49,9 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
   album art opens the expanded player. Space/Ctrl+P toggles playback and Left/Right changes tracks
   when the app is focused and no text field is active; queued songs advance while unfocused
 - Toolbar and navigation icons load from SVG assets at runtime
-- Custom borderless title bar with `SupremyTommy` credit, grouped app menu, window controls, drag-to-move, and edge resizing
+- Custom borderless title bar with `SupremyTommy` credit, responsive menus, window controls, drag-to-move, and edge resizing
+- Fast eased page and search-panel movement alongside fades; motion can be disabled in Settings
+- Optional “What’s new” release notes in the Help menu
 - Animated startup credit splash for `SupremyTommy`
 - `.lrc` sidecar lyrics display; removing a track from the library preserves its audio file
 - Collaborative artist credits and album-title grouping, with placeholder artist/album metadata omitted
