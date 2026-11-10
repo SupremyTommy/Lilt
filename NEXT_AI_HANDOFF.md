@@ -6,7 +6,7 @@ Lilt is a native Windows music player written in Rust and egui. The Rust project
 
 ## Current work
 
-Release `v0.2.8` is published. The working tree now contains a v0.2.11 release candidate with the File Explorer fix, custom borderless title bar, and startup credit splash:
+Release `v0.2.11` is published with the File Explorer fix, custom borderless title bar, and startup credit splash:
 
 - Smart Mixes has a dedicated icon at `assets/icons/ic-smart-mixes-24px.svg`.
 - The Smart Mixes page and navigation already use vertical scrolling.
@@ -32,7 +32,7 @@ For v0.2.8, `cmd /c build-release.bat` completed successfully and produced:
 
 ## GitHub release status
 
-Release `v0.2.8` is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.8. The v0.2.11 candidate has not yet been committed or published. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope.
+Release `v0.2.11` is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.11. GitHub verified the standalone EXE, MSI, and portable ZIP are uploaded. The release commit is `90f9e16`; the annotated tag is `v0.2.11`. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope.
 
 The user's instruction is to publish the GitHub release through the terminal and to leave this handoff file in the Rust project folder.
 
