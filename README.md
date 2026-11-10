@@ -7,7 +7,7 @@ Native Windows desktop player. It does not need Python or a Python runtime.
 ## Build
 
 Install the stable Rust toolchain with the MSVC target and run `build-release.bat`.
-The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.1-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.1-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
+The optimized Windows executable is written to `target\release\lilt-player.exe` without a console window. The script creates `dist\Lilt-v0.2.3-windows-x64.zip` as a portable package and `dist\Lilt-v0.2.3-windows-x64.msi` as a per-user installer. The MSI wizard lets you choose optional Start Menu and Desktop shortcuts.
 
 The release script installs WiX Toolset 7 locally if needed. On a fresh setup, read and accept its EULA once by following the [WiX EULA instructions](https://docs.firegiant.com/wix/osmf/) before building the MSI.
 
@@ -30,7 +30,9 @@ The release script installs WiX Toolset 7 locally if needed. On a fresh setup, r
 - Windows multimedia keys for play/pause, next, previous, and stop, with current-track metadata
   shared with the system media overlay
 - Compact bottom player bar with a seek timeline; Space/Ctrl+P toggles playback and Left/Right
-  changes tracks when the app is focused and no text field is active; Ctrl+F or `/` focuses search
+  changes tracks when the app is focused and no text field is active; queued songs advance while
+  the window is unfocused; Ctrl+F or `/` focuses search
+- Toolbar and navigation icons load from SVG assets at runtime
 - `.lrc` sidecar lyrics display; removing a track from the library preserves its audio file
 - Collaborative artist credits and album-title grouping, with placeholder artist/album metadata omitted
 

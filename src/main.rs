@@ -6426,94 +6426,99 @@ impl PlayerApp {
         const ICONS: &[(&str, &[u8])] = &[
             (
                 "play",
-                include_bytes!("../assets/icons/ic-play-arrow-24px.png"),
+                include_bytes!("../assets/icons/ic-play-arrow-24px.svg"),
             ),
-            ("pause", include_bytes!("../assets/icons/ic-pause-24px.png")),
+            ("pause", include_bytes!("../assets/icons/ic-pause-24px.svg")),
             (
                 "previous",
-                include_bytes!("../assets/icons/ic-skip-previous-24px.png"),
+                include_bytes!("../assets/icons/ic-skip-previous-24px.svg"),
             ),
             (
                 "next",
-                include_bytes!("../assets/icons/ic-skip-next-24px.png"),
+                include_bytes!("../assets/icons/ic-skip-next-24px.svg"),
             ),
             (
                 "favorite",
-                include_bytes!("../assets/icons/ic-favorite-24px.png"),
+                include_bytes!("../assets/icons/ic-favorite-24px.svg"),
             ),
             (
                 "favorite_border",
-                include_bytes!("../assets/icons/ic-favorite-border-24px.png"),
+                include_bytes!("../assets/icons/ic-favorite-border-24px.svg"),
             ),
             (
                 "shuffle",
-                include_bytes!("../assets/icons/ic-shuffle-24px.png"),
+                include_bytes!("../assets/icons/ic-shuffle-24px.svg"),
             ),
             (
                 "repeat",
-                include_bytes!("../assets/icons/ic-repeat-24px.png"),
+                include_bytes!("../assets/icons/ic-repeat-24px.svg"),
             ),
             (
                 "repeat_one",
-                include_bytes!("../assets/icons/ic-repeat-one-24px.png"),
+                include_bytes!("../assets/icons/ic-repeat-one-24px.svg"),
             ),
             (
                 "volume_up",
-                include_bytes!("../assets/icons/ic-volume-up-24px.png"),
+                include_bytes!("../assets/icons/ic-volume-up-24px.svg"),
             ),
             (
                 "volume_down",
-                include_bytes!("../assets/icons/ic-volume-down-24px.png"),
+                include_bytes!("../assets/icons/ic-volume-down-24px.svg"),
             ),
             (
                 "volume_off",
-                include_bytes!("../assets/icons/ic-volume-off-24px.png"),
+                include_bytes!("../assets/icons/ic-volume-off-24px.svg"),
             ),
-            ("home", include_bytes!("../assets/icons/ic-home-24px.png")),
+            ("home", include_bytes!("../assets/icons/ic-home-24px.svg")),
             (
                 "songs",
-                include_bytes!("../assets/icons/ic-library-music-24px.png"),
+                include_bytes!("../assets/icons/ic-library-music-24px.svg"),
             ),
             (
                 "library_books",
-                include_bytes!("../assets/icons/ic-library-books-24px.png"),
+                include_bytes!("../assets/icons/ic-library-books-24px.svg"),
             ),
-            ("album", include_bytes!("../assets/icons/ic-album-24px.png")),
+            ("album", include_bytes!("../assets/icons/ic-album-24px.svg")),
             (
                 "person",
-                include_bytes!("../assets/icons/ic-person-24px.png"),
+                include_bytes!("../assets/icons/ic-person-24px.svg"),
             ),
             (
                 "history",
-                include_bytes!("../assets/icons/ic-history-24px.png"),
+                include_bytes!("../assets/icons/ic-history-24px.svg"),
             ),
             (
                 "dislike",
-                include_bytes!("../assets/icons/ic-thumb-down-24px.png"),
+                include_bytes!("../assets/icons/ic-thumb-down-24px.svg"),
+            ),
+            (
+                "like",
+                include_bytes!("../assets/icons/ic-thumb-up-24px.svg"),
+            ),
+            (
+                "like_outline",
+                include_bytes!("../assets/icons/ic-thumb-up-outline-24px.svg"),
             ),
             (
                 "lyrics",
-                include_bytes!("../assets/icons/ic-subtitles-24px.png"),
+                include_bytes!("../assets/icons/ic-subtitles-24px.svg"),
             ),
             (
                 "settings",
-                include_bytes!("../assets/icons/ic-settings-24px.png"),
+                include_bytes!("../assets/icons/ic-settings-24px.svg"),
             ),
             (
                 "discover",
-                include_bytes!("../assets/icons/ic-equalizer-24px.png"),
+                include_bytes!("../assets/icons/ic-equalizer-24px.svg"),
             ),
         ];
         for (name, bytes) in ICONS {
             if self.ui_icons.contains_key(name) {
                 continue;
             }
-            let Ok(decoded) = image::load_from_memory(bytes) else {
+            let Ok(image) = egui_extras::image::load_svg_bytes(bytes) else {
                 continue;
             };
-            let rgba = decoded.to_rgba8();
-            let size = [rgba.width() as usize, rgba.height() as usize];
-            let image = egui::ColorImage::from_rgba_unmultiplied(size, rgba.as_raw());
             self.ui_icons.insert(
                 *name,
                 context.load_texture(
@@ -6597,7 +6602,9 @@ impl eframe::App for PlayerApp {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
-        if window_focused && self.sink.as_ref().is_some_and(Sink::empty) {
+        // Playback must keep advancing while the window is unfocused, even though
+        // library scans, artwork, and other UI work stay paused until focus returns.
+        if self.sink.as_ref().is_some_and(Sink::empty) {
             self.next_track();
         }
         #[cfg(target_os = "windows")]
@@ -6641,8 +6648,24 @@ impl eframe::App for PlayerApp {
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
         if window_focused && audio_is_playing {
             // A 10 FPS refresh keeps the compact equalizer/progress animation smooth
-            // while focused. When unfocused, let the event loop sleep until focus returns.
+            // while focused. While unfocused, wake only at the estimated track end.
             ctx.request_repaint_after(Duration::from_millis(100));
+        } else if audio_is_playing {
+            // Wake once near the end of the current song so the queue can advance
+            // without polling or refreshing the UI while the player is unfocused.
+            let duration = self
+                .current
+                .and_then(|position| self.queue.get(position))
+                .and_then(|&index| self.tracks.get(index))
+                .map(|track| Duration::from_secs_f64(track.duration.max(0.0)));
+            let position = self.playback_offset
+                + self.sink.as_ref().map_or(Duration::ZERO, Sink::get_pos);
+            let until_end = duration
+                .map_or(Duration::from_secs(1), |duration| {
+                    duration.saturating_sub(position)
+                })
+                .max(Duration::from_millis(50));
+            ctx.request_repaint_after(until_end);
         } else if window_focused && (self.scan_busy || self.duplicate_scan_busy) {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
@@ -6934,7 +6957,7 @@ impl eframe::App for PlayerApp {
                             (
                                 "YOUR MUSIC",
                                 vec![
-                                    (Page::LikedSongs, "Liked music", "favorite"),
+                                    (Page::LikedSongs, "Liked music", "like"),
                                     (Page::LikedArtists, "Liked artists", "person"),
                                     (Page::LikedAlbums, "Saved albums", "favorite"),
                                 ],
@@ -7661,9 +7684,9 @@ impl eframe::App for PlayerApp {
                                         current_track_index.is_some(),
                                         egui::Button::image(
                                             egui::Image::new(if current_track_liked {
-                                                &self.ui_icons["favorite"]
+                                                &self.ui_icons["like"]
                                             } else {
-                                                &self.ui_icons["favorite_border"]
+                                                &self.ui_icons["like_outline"]
                                             })
                                             .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
