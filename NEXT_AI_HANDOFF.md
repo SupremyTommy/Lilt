@@ -27,7 +27,7 @@ This checkout is being prepared for release `v0.2.8`:
 
 ## GitHub release status
 
-The latest published tag is `v0.2.7`; `v0.2.8` did not exist when checked. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope. The release commit is local, `main` is one commit ahead of `origin/main`, and fetch found no remote changes. Push the release commit and tag, then attach the MSI, standalone EXE, and ZIP through `gh release create`.
+Release `v0.2.8` is published at https://github.com/ultimatebloxstudium-tech/Lilt/releases/tag/v0.2.8. GitHub verified the standalone EXE, MSI, and portable ZIP are uploaded. The release commit is `cb3c364`; the annotated tag is `v0.2.8`. GitHub CLI device login completed successfully as `ultimatebloxstudium-tech` with `repo` scope.
 
 The user's instruction is to publish the GitHub release through the terminal and to leave this handoff file in the Rust project folder.
 
