@@ -17,7 +17,8 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
 
 - Background folder scanning, metadata, embedded album artwork, and library search
 - Optional missing album-cover and artist-portrait lookup through MusicBrainz/Cover Art Archive and Wikimedia. It runs in the background, updates progress every 50 items, and caches results locally. Album lookup applies to supported audio files with artist/album metadata.
-- Live typed search suggestions show at most five mixed song, artist, and album results with cover art; artist-name queries prioritize artist matches. Down enters results, Up returns to the search field, and Enter in the field opens grouped library search
+- Live typed search suggestions show at most five mixed song, artist, and album results with cover art; artist-name queries prioritize artist matches. The result canvas uses available window height, resets scrolling for each query, and never highlights a result while the textbox has focus. Down enters results, Up returns to the search field, and Enter in the field opens grouped library search
+- When a Google AI key is configured, Ask AI appears as the first selectable live-search result; arrow keys navigate to the library matches below it
 - Ask AI opens a separate answer panel with a short response and matching songs at the end; it uses a configured Google AI key
 - Optional AI library review can flag likely duplicate recordings and high-confidence artist-credit mistakes for manual review; it does not change tags automatically
 - Home and Discover pages with personalized recommendations, genre and decade mixes, and artist radio

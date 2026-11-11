@@ -1,7 +1,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Lilt" Manufacturer="UltimateBloxStudium"
-           Version="0.2.15" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
+           Version="0.2.16" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
            Scope="perUser" InstallerVersion="500">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lilt is already installed." />
     <MediaTemplate EmbedCab="yes" />
@@ -26,17 +26,17 @@
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Lilt">
           <Component Id="LiltExecutable" Guid="*">
-            <File Id="LiltExe" Source="dist/Lilt-v0.2.15-windows-x64/lilt-player.exe" KeyPath="yes" />
+            <File Id="LiltExe" Source="dist/Lilt-v0.2.16-windows-x64/lilt-player.exe" KeyPath="yes" />
             <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="Installed" Type="integer" Value="1" />
           </Component>
           <Component Id="LiltPngIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.15-windows-x64/app_icon.png" />
+            <File Source="dist/Lilt-v0.2.16-windows-x64/app_icon.png" />
           </Component>
           <Component Id="LiltIcoIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.15-windows-x64/app_icon.ico" />
+            <File Source="dist/Lilt-v0.2.16-windows-x64/app_icon.ico" />
           </Component>
           <Component Id="LiltReadme" Guid="*">
-            <File Source="dist/Lilt-v0.2.15-windows-x64/README.md" />
+            <File Source="dist/Lilt-v0.2.16-windows-x64/README.md" />
           </Component>
           <Component Id="LiltExplorerBackground" Guid="*">
             <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer">

@@ -6707,8 +6707,8 @@ impl PlayerApp {
                 }
             }
         }
-        let empty_ai_row = suggestions.is_empty() && self.google_ai_key_saved;
-        let navigable_rows = suggestions.len().max(usize::from(empty_ai_row));
+        let ai_row = self.google_ai_key_saved;
+        let navigable_rows = suggestions.len() + usize::from(ai_row);
         if keyboard.0 {
             if search_field_focused {
                 self.search_suggestions_focused = true;
@@ -6732,9 +6732,12 @@ impl PlayerApp {
         let mut album_open = None;
         let mut ask_ai = false;
         if keyboard.2 && self.search_suggestions_focused {
-            if empty_ai_row {
-                ask_ai = self.search_suggestion_selection == 0;
-            } else if let Some(suggestion) = suggestions.get(self.search_suggestion_selection) {
+            if ai_row && self.search_suggestion_selection == 0 {
+                ask_ai = !self.search_ai_pending;
+            } else if let Some(suggestion) = suggestions.get(
+                self.search_suggestion_selection
+                    .saturating_sub(usize::from(ai_row)),
+            ) {
                 match suggestion {
                     SearchSuggestion::Song(index) => play = Some((*index, songs.clone())),
                     SearchSuggestion::Artist(artist) => artist_open = Some(artist.clone()),
@@ -6742,15 +6745,44 @@ impl PlayerApp {
                 }
             }
         }
-        let available_height =
-            (ctx.screen_rect().bottom() - search_rect.bottom() - 16.0).clamp(92.0, 520.0);
+        // A single scroll-area ID keeps its offset as search results change. If a long
+        // result list was scrolled and the next query is shorter, that stale offset
+        // can leave the popup looking clipped; when the list grows again it can seem
+        // like the popup never expanded. Reset only when the query changes so normal
+        // scrolling remains available while the user browses one query.
+        let scroll_reset_id = egui::Id::new("live-search-suggestions-query");
+        let query_changed = ctx.data_mut(|data| {
+            let previous = data.get_temp::<String>(scroll_reset_id);
+            let changed = previous.as_deref() != Some(query.as_str());
+            data.insert_temp(scroll_reset_id, query.clone());
+            changed
+        });
+        let screen = ctx.screen_rect();
+        let space_below = (screen.bottom() - search_rect.bottom() - 16.0).max(0.0);
+        let space_above = (search_rect.top() - screen.top() - 16.0).max(0.0);
+        let preferred_height = (screen.height() * 0.68).clamp(360.0, 720.0);
+        let popup_above = space_below < preferred_height + 4.0 && space_above > space_below;
+        // Use the largest practical canvas for this window. Its height now changes
+        // with the app size, not with each query's result count.
+        let available_height = ((if popup_above {
+            space_above
+        } else {
+            space_below
+        }) - 76.0)
+            .min(preferred_height)
+            .max(1.0);
         let popup_width = search_rect
             .width()
             .max(620.0)
             .min(ctx.screen_rect().right() - search_rect.left() - 16.0);
         egui::Area::new(egui::Id::new("live-search-suggestions"))
             .order(egui::Order::Foreground)
-            .fixed_pos(search_rect.left_bottom() + egui::vec2(0.0, 4.0 - (1.0 - openness) * 10.0))
+            .fixed_pos(if popup_above {
+                search_rect.left_top() - egui::vec2(0.0, 80.0 + available_height)
+                    + egui::vec2(0.0, (1.0 - openness) * 10.0)
+            } else {
+                search_rect.left_bottom() + egui::vec2(0.0, 4.0 - (1.0 - openness) * 10.0)
+            })
             .show(ctx, |ui| {
                 ui.set_opacity(openness);
                 egui::Frame::popup(ui.style())
@@ -6761,119 +6793,218 @@ impl PlayerApp {
                     .show(ui, |ui| {
                         ui.set_min_width(popup_width);
                         ui.set_max_width(popup_width);
-                        egui::ScrollArea::vertical()
-                            .auto_shrink([true, true])
-                            .max_height(available_height)
-                            .show(ui, |ui| {
+                        ui.horizontal(|ui| {
+                            if let Some(icon) = self.ui_icons.get("songs") {
+                                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(21.0)));
+                            }
+                            ui.label(RichText::new("Search").size(19.0).strong());
+                        });
+                        ui.add_space(6.0);
+                        let mut scroll_area = egui::ScrollArea::vertical()
+                            .auto_shrink([true, false])
+                            .max_height(available_height);
+                        if query_changed {
+                            scroll_area = scroll_area.vertical_scroll_offset(0.0);
+                        }
+                        scroll_area.show(ui, |ui| {
+                            if ai_row {
+                                let selected = self.search_suggestions_focused
+                                    && self.search_suggestion_selection == 0;
+                                let mut clicked = false;
                                 ui.horizontal(|ui| {
-                                    if let Some(icon) = self.ui_icons.get("songs") {
+                                    if let Some(icon) = self.ui_icons.get("sparkles") {
                                         ui.add(
                                             egui::Image::new(icon)
-                                                .fit_to_exact_size(Vec2::splat(21.0)),
+                                                .fit_to_exact_size(Vec2::splat(48.0)),
                                         );
                                     }
-                                    ui.label(RichText::new("Search").size(19.0).strong());
-                                    if !suggestions.is_empty() && self.google_ai_key_saved {
-                                        if ui
-                                            .button("Ask AI")
-                                            .clicked()
-                                            && !self.search_ai_pending
-                                        {
-                                            ask_ai = true;
-                                        }
-                                    }
+                                    clicked = ui
+                                        .add_enabled(
+                                            !self.search_ai_pending,
+                                            egui::Button::new(
+                                                RichText::new(format!("Ask AI · {query}"))
+                                                    .size(18.0)
+                                                    .strong(),
+                                            )
+                                            .selected(selected),
+                                        )
+                                        .clicked();
                                 });
-                                if suggestions.is_empty() {
-                                    if empty_ai_row {
-                                        let selected = self.search_suggestion_selection == 0;
-                                        ui.horizontal(|ui| {
-                                            if let Some(icon) = self.ui_icons.get("sparkles") {
-                                                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(22.0)));
-                                            }
-                                            if ui.selectable_label(selected, RichText::new(format!("Ask AI about ‘{}’", query)).strong()).clicked() && !self.search_ai_pending {
-                                                ask_ai = true;
-                                            }
-                                        });
-                                    } else {
-                                        ui.horizontal(|ui| {
-                                            if let Some(icon) = self.ui_icons.get("search") {
-                                                ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)));
-                                            }
-                                            ui.label(RichText::new("No matches. Try another title, artist, or album.").color(Color32::GRAY));
-                                        });
-                                    }
+                                if clicked {
+                                    ask_ai = true;
                                 }
-                                for (row, suggestion) in suggestions.iter().enumerate() {
-                                    let selected = row == self.search_suggestion_selection;
-                                    let clicked = match suggestion {
-                                        SearchSuggestion::Song(index) => {
-                                            let cover = self.artwork_texture(ui.ctx(), *index);
-                                            let (title, artist, album) = self.tracks.get(*index)
-                                                .map(|track| (track.title.clone(), track.artist.clone(), track.album.clone()))
-                                                .unwrap_or_default();
-                                            let response = ui.horizontal(|ui| {
-                                                if let Some(texture) = cover {
-                                                    ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(56.0)));
-                                                } else {
-                                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
-                                                    paint_cover_or_placeholder(ui, None, rect, *index);
-                                                }
-                                                ui.vertical(|ui| {
-                                                    let title_response = ui.selectable_label(selected, RichText::new(&title).size(18.0).strong());
-                                                    ui.label(RichText::new(format!("Song  ·  {}  ·  {}", display_metadata(&artist), display_metadata(&album)))
-                                                        .size(14.0).color(Color32::from_rgb(182, 185, 196)));
-                                                    title_response
-                                                }).inner
-                                            }).inner;
-                                            if response.clicked() { play = Some((*index, songs.clone())); }
-                                            false
-                                        }
-                                        SearchSuggestion::Artist(artist) => {
-                                            let mut open = false;
-                                            ui.horizontal(|ui| {
-                                                if let Some(icon) = self.ui_icons.get("person") {
-                                                    ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(48.0)));
-                                                }
-                                                ui.vertical(|ui| {
-                                                    open = ui.selectable_label(selected, RichText::new(artist).size(18.0).strong()).clicked();
-                                                    ui.label(RichText::new("Artist").size(14.0).color(Color32::from_rgb(182, 185, 196)));
-                                                });
-                                            });
-                                            if open { artist_open = Some(artist.clone()); }
-                                            false
-                                        }
-                                        SearchSuggestion::Album(album, index) => {
-                                            let cover = self.artwork_texture(ui.ctx(), *index);
-                                            let artist = self.tracks.get(*index).map(|track| track.artist.clone()).unwrap_or_default();
-                                            let mut open = false;
-                                            ui.horizontal(|ui| {
-                                                if let Some(texture) = cover {
-                                                    ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(56.0)));
-                                                } else {
-                                                    let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
-                                                    paint_cover_or_placeholder(ui, None, rect, *index);
-                                                }
-                                                ui.vertical(|ui| {
-                                                    open = ui.selectable_label(selected, RichText::new(album).size(18.0).strong()).clicked();
-                                                    ui.label(RichText::new(format!("Album  ·  {}", display_metadata(&artist))).size(14.0).color(Color32::from_rgb(182, 185, 196)));
-                                                });
-                                            });
-                                            if open { album_open = Some(album.clone()); }
-                                            false
-                                        }
-                                    };
-                                    let _ = clicked;
-                                }
+                                ui.label(
+                                    RichText::new("Ask Google AI about your library")
+                                        .small()
+                                        .color(Color32::from_rgb(182, 185, 196)),
+                                );
+                                ui.separator();
+                            }
+                            if suggestions.is_empty() {
                                 ui.horizontal(|ui| {
-                                    for (key, icon_key) in [("Down", "arrow_down"), ("Up", "arrow_up")] {
-                                        ui.label(RichText::new(key).small().color(Color32::GRAY));
-                                        if let Some(icon) = self.ui_icons.get(icon_key) {
-                                            ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(16.0)));
-                                        }
+                                    if let Some(icon) = self.ui_icons.get("search") {
+                                        ui.add(
+                                            egui::Image::new(icon)
+                                                .fit_to_exact_size(Vec2::splat(18.0)),
+                                        );
                                     }
-                                    ui.label(RichText::new("Enter: search · Esc: close").small().color(Color32::GRAY));
+                                    ui.label(
+                                        RichText::new(
+                                            "No matches. Try another title, artist, or album.",
+                                        )
+                                        .color(Color32::GRAY),
+                                    );
                                 });
-                            });
+                            }
+                            for (row, suggestion) in suggestions.iter().enumerate() {
+                                let selected = self.search_suggestions_focused
+                                    && row + usize::from(ai_row)
+                                        == self.search_suggestion_selection;
+                                let clicked = match suggestion {
+                                    SearchSuggestion::Song(index) => {
+                                        let cover = self.artwork_texture(ui.ctx(), *index);
+                                        let (title, artist, album) = self
+                                            .tracks
+                                            .get(*index)
+                                            .map(|track| {
+                                                (
+                                                    track.title.clone(),
+                                                    track.artist.clone(),
+                                                    track.album.clone(),
+                                                )
+                                            })
+                                            .unwrap_or_default();
+                                        let response = ui
+                                            .horizontal(|ui| {
+                                                if let Some(texture) = cover {
+                                                    ui.add(
+                                                        egui::Image::new(&texture)
+                                                            .fit_to_exact_size(Vec2::splat(56.0)),
+                                                    );
+                                                } else {
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        Vec2::splat(56.0),
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    paint_cover_or_placeholder(
+                                                        ui, None, rect, *index,
+                                                    );
+                                                }
+                                                ui.vertical(|ui| {
+                                                    let title_response = ui.selectable_label(
+                                                        selected,
+                                                        RichText::new(&title).size(18.0).strong(),
+                                                    );
+                                                    ui.label(
+                                                        RichText::new(format!(
+                                                            "Song  ·  {}  ·  {}",
+                                                            display_metadata(&artist),
+                                                            display_metadata(&album)
+                                                        ))
+                                                        .size(14.0)
+                                                        .color(Color32::from_rgb(182, 185, 196)),
+                                                    );
+                                                    title_response
+                                                })
+                                                .inner
+                                            })
+                                            .inner;
+                                        if response.clicked() {
+                                            play = Some((*index, songs.clone()));
+                                        }
+                                        false
+                                    }
+                                    SearchSuggestion::Artist(artist) => {
+                                        let mut open = false;
+                                        ui.horizontal(|ui| {
+                                            if let Some(icon) = self.ui_icons.get("person") {
+                                                ui.add(
+                                                    egui::Image::new(icon)
+                                                        .fit_to_exact_size(Vec2::splat(48.0)),
+                                                );
+                                            }
+                                            ui.vertical(|ui| {
+                                                open = ui
+                                                    .selectable_label(
+                                                        selected,
+                                                        RichText::new(artist).size(18.0).strong(),
+                                                    )
+                                                    .clicked();
+                                                ui.label(
+                                                    RichText::new("Artist")
+                                                        .size(14.0)
+                                                        .color(Color32::from_rgb(182, 185, 196)),
+                                                );
+                                            });
+                                        });
+                                        if open {
+                                            artist_open = Some(artist.clone());
+                                        }
+                                        false
+                                    }
+                                    SearchSuggestion::Album(album, index) => {
+                                        let cover = self.artwork_texture(ui.ctx(), *index);
+                                        let artist = self
+                                            .tracks
+                                            .get(*index)
+                                            .map(|track| track.artist.clone())
+                                            .unwrap_or_default();
+                                        let mut open = false;
+                                        ui.horizontal(|ui| {
+                                            if let Some(texture) = cover {
+                                                ui.add(
+                                                    egui::Image::new(&texture)
+                                                        .fit_to_exact_size(Vec2::splat(56.0)),
+                                                );
+                                            } else {
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    Vec2::splat(56.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                paint_cover_or_placeholder(ui, None, rect, *index);
+                                            }
+                                            ui.vertical(|ui| {
+                                                open = ui
+                                                    .selectable_label(
+                                                        selected,
+                                                        RichText::new(album).size(18.0).strong(),
+                                                    )
+                                                    .clicked();
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "Album  ·  {}",
+                                                        display_metadata(&artist)
+                                                    ))
+                                                    .size(14.0)
+                                                    .color(Color32::from_rgb(182, 185, 196)),
+                                                );
+                                            });
+                                        });
+                                        if open {
+                                            album_open = Some(album.clone());
+                                        }
+                                        false
+                                    }
+                                };
+                                let _ = clicked;
+                            }
+                        });
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            for (key, icon_key) in [("Down", "arrow_down"), ("Up", "arrow_up")] {
+                                ui.label(RichText::new(key).small().color(Color32::GRAY));
+                                if let Some(icon) = self.ui_icons.get(icon_key) {
+                                    ui.add(
+                                        egui::Image::new(icon).fit_to_exact_size(Vec2::splat(16.0)),
+                                    );
+                                }
+                            }
+                            ui.label(
+                                RichText::new("Enter: search · Esc: close")
+                                    .small()
+                                    .color(Color32::GRAY),
+                            );
+                        });
                     });
             });
         if let Some((index, queue)) = play {
@@ -10091,6 +10222,7 @@ impl eframe::App for PlayerApp {
 
         let mut search_rect = None;
         let mut search_focused = false;
+        let mut search_entered = false;
         egui::TopBottomPanel::top("top-bar")
             .frame(
                 egui::Frame::new()
@@ -10349,10 +10481,18 @@ impl eframe::App for PlayerApp {
                         self.search_ai_results.clear();
                         self.search_committed = false;
                     }
+                    if search_response.clicked() || search_response.gained_focus() {
+                        // Clicking or tabbing back into the textbox exits suggestion
+                        // navigation so the first result is never implicitly selected.
+                        self.search_suggestions_focused = false;
+                    }
+                    search_focused = search_response.has_focus();
+                    search_entered = search_focused
+                        && ctx.input(|input| input.key_pressed(egui::Key::Enter))
+                        && !self.query.trim().is_empty();
                     if self.search_suggestions_focused {
                         search_response.surrender_focus();
                     }
-                    search_focused = search_response.has_focus();
                     search_rect = Some(search_response.rect);
                     if ui
                         .selectable_label(
@@ -10437,12 +10577,11 @@ impl eframe::App for PlayerApp {
         if let Some(search_rect) = search_rect {
             self.show_search_suggestions(ctx, search_rect);
         }
-        if search_focused
-            && ctx.input(|input| input.key_pressed(egui::Key::Enter))
-            && !self.query.trim().is_empty()
-        {
+        if search_entered {
             self.search_committed = true;
             self.search_suggestions_open = false;
+            self.search_suggestions_focused = false;
+            self.search_suggestion_selection = 0;
             self.page = Page::Home;
         }
 
