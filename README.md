@@ -21,6 +21,7 @@ The release script installs WiX Toolset 7 locally if needed. WiX may ask the dev
 - When a Google AI key is configured, Ask AI appears as the first selectable live-search result; arrow keys navigate to the library matches below it
 - Ask AI opens a separate answer panel with a short response and matching songs at the end; it uses a configured Google AI key
 - Optional AI library review can flag likely duplicate recordings and high-confidence artist-credit mistakes for manual review; it does not change tags automatically
+- Google AI is available from live search as the first keyboard result, for conversational library questions, music recommendations, and optional duplicate/artist-credit review
 - Home and Discover pages with personalized recommendations, genre and decade mixes, and artist radio
 - Responsive File, Playback, View, Help, and Playlists menus in the title bar, with a grouped overflow menu on narrower windows; playlists remain available in the sidebar
 - Larger YouTube Music-inspired layout with Songs, Albums, Artists, Likes, Playlists,

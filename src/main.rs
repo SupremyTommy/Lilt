@@ -175,11 +175,7 @@ fn show_custom_window_controls(ui: &mut egui::Ui, context: &egui::Context) {
             context.send_viewport_cmd(egui::ViewportCommand::Close);
         }
         let maximized = context.input(|input| input.viewport().maximized.unwrap_or(false));
-        if ui
-            .add_sized(
-                [42.0, 34.0],
-                egui::Button::new(if maximized { "❐" } else { "□" }),
-            )
+        if add_window_state_button(ui, maximized)
             .on_hover_text(if maximized { "Restore" } else { "Maximize" })
             .clicked()
         {
@@ -193,6 +189,56 @@ fn show_custom_window_controls(ui: &mut egui::Ui, context: &egui::Context) {
             context.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
         }
     });
+}
+
+fn add_window_state_button(ui: &mut egui::Ui, maximized: bool) -> egui::Response {
+    let response = ui.add_sized([42.0, 34.0], egui::Button::new(""));
+    let center = response.rect.center();
+    let stroke = egui::Stroke::new(1.5_f32, Color32::from_rgb(220, 222, 230));
+    let painter = ui.painter();
+    let main_rect = egui::Rect::from_center_size(center, Vec2::splat(13.0));
+    if maximized {
+        let back_rect = main_rect.translate(Vec2::new(-2.5, 2.5));
+        let front_rect = main_rect.translate(Vec2::new(2.5, -2.5));
+        painter.rect_stroke(
+            back_rect,
+            egui::CornerRadius::ZERO,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+        painter.rect_stroke(
+            front_rect,
+            egui::CornerRadius::ZERO,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    } else {
+        painter.rect_stroke(
+            main_rect,
+            egui::CornerRadius::ZERO,
+            stroke,
+            egui::StrokeKind::Inside,
+        );
+    }
+    response
+}
+
+fn icon_text_button(
+    ui: &mut egui::Ui,
+    icon: Option<&egui::TextureHandle>,
+    label: impl Into<egui::WidgetText>,
+    selected: bool,
+) -> egui::Response {
+    let label = label.into();
+    let button = if let Some(icon) = icon {
+        egui::Button::image_and_text(
+            egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)),
+            label,
+        )
+    } else {
+        egui::Button::new(label)
+    };
+    ui.add(button.selected(selected))
 }
 
 fn show_custom_window_resize_grips(context: &egui::Context) {
@@ -1718,7 +1764,7 @@ impl PlayerApp {
                 play_now = true;
                 ui.close_menu();
             }
-            if ui.button("⏭  Play next").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("next"), "Play next", false).clicked() {
                 play_next = true;
                 ui.close_menu();
             }
@@ -1726,7 +1772,14 @@ impl PlayerApp {
                 enqueue = true;
                 ui.close_menu();
             }
-            if ui.button("◉  Start song radio").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("music_note"),
+                "Start song radio",
+                false,
+            )
+            .clicked()
+            {
                 start_radio = true;
                 ui.close_menu();
             }
@@ -1754,16 +1807,21 @@ impl PlayerApp {
                 ui.close_menu();
             }
             ui.separator();
-            if !is_unknown(&album) && ui.button("▣  Go to album").clicked() {
+            if !is_unknown(&album)
+                && icon_text_button(ui, self.ui_icons.get("album"), "Go to album", false).clicked()
+            {
                 open_album = true;
                 ui.close_menu();
             }
-            if artist.is_some() && ui.button("♙  Go to artist").clicked() {
+            if artist.is_some()
+                && icon_text_button(ui, self.ui_icons.get("person"), "Go to artist", false)
+                    .clicked()
+            {
                 open_artist = true;
                 ui.close_menu();
             }
             if !playlist_names.is_empty() {
-                ui.menu_button("＋  Add to playlist", |ui| {
+                ui.menu_button("Add to playlist", |ui| {
                     for (playlist_index, name) in playlist_names.iter().enumerate() {
                         if ui.button(name).clicked() {
                             add_to_playlist = Some(playlist_index);
@@ -1772,12 +1830,20 @@ impl PlayerApp {
                     }
                 });
             }
-            if ui.button("＋  Create playlist from song").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("add"),
+                "Create playlist from song",
+                false,
+            )
+            .clicked()
+            {
                 create_playlist = true;
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("▤  Copy song details").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("copy"), "Copy song details", false).clicked()
+            {
                 ui.ctx().copy_text(format!(
                     "{} — {}\nAlbum: {}\n{}",
                     title,
@@ -1787,16 +1853,30 @@ impl PlayerApp {
                 ));
                 ui.close_menu();
             }
-            if ui.button("▣  Copy file path").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("copy"), "Copy file path", false).clicked() {
                 ui.ctx().copy_text(path.to_string_lossy().into_owned());
                 ui.close_menu();
             }
-            if ui.button("↗  Reveal file in Explorer").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("folder_open"),
+                "Reveal file in Explorer",
+                false,
+            )
+            .clicked()
+            {
                 #[cfg(target_os = "windows")]
                 reveal_path_in_explorer(&path);
                 ui.close_menu();
             }
-            if ui.button("◷  Clear this song from history").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("history"),
+                "Clear this song from history",
+                false,
+            )
+            .clicked()
+            {
                 clear_history = true;
                 ui.close_menu();
             }
@@ -1962,11 +2042,12 @@ impl PlayerApp {
                 play = true;
                 ui.close_menu();
             }
-            if ui.button("🔀  Shuffle album").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle album", false).clicked()
+            {
                 shuffle = true;
                 ui.close_menu();
             }
-            if ui.button("⏭  Play album next").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("next"), "Play album next", false).clicked() {
                 enqueue = true;
                 ui.close_menu();
             }
@@ -1981,12 +2062,13 @@ impl PlayerApp {
                 toggle_saved = true;
                 ui.close_menu();
             }
-            if ui.button("▣  Open album page").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("album"), "Open album page", false).clicked()
+            {
                 open = true;
                 ui.close_menu();
             }
             if !playlist_names.is_empty() {
-                ui.menu_button("＋  Add album to playlist", |ui| {
+                ui.menu_button("Add album to playlist", |ui| {
                     for (playlist_index, name) in playlist_names.iter().enumerate() {
                         if ui.button(name).clicked() {
                             add_to_playlist = Some(playlist_index);
@@ -1995,17 +2077,38 @@ impl PlayerApp {
                     }
                 });
             }
-            if ui.button("＋  Create playlist from album").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("add"),
+                "Create playlist from album",
+                false,
+            )
+            .clicked()
+            {
                 create_playlist = true;
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("▤  Copy album and artist").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("copy"),
+                "Copy album and artist",
+                false,
+            )
+            .clicked()
+            {
                 ui.ctx()
                     .copy_text(format!("{}\n{}", album, credits.join(", ")));
                 ui.close_menu();
             }
-            if ui.button("▤  Copy all album file paths").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("copy"),
+                "Copy all album file paths",
+                false,
+            )
+            .clicked()
+            {
                 let listing = tracks
                     .iter()
                     .filter_map(|&index| {
@@ -2019,7 +2122,14 @@ impl PlayerApp {
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("◷  Clear album listening history").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("history"),
+                "Clear album listening history",
+                false,
+            )
+            .clicked()
+            {
                 clear_history = true;
                 ui.close_menu();
             }
@@ -2156,15 +2266,24 @@ impl PlayerApp {
                 play = true;
                 ui.close_menu();
             }
-            if ui.button("🔀  Shuffle artist").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle artist", false).clicked()
+            {
                 shuffle = true;
                 ui.close_menu();
             }
-            if ui.button("⏭  Play artist next").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("next"), "Play artist next", false).clicked()
+            {
                 enqueue = true;
                 ui.close_menu();
             }
-            if ui.button("◉  Start artist radio").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("music_note"),
+                "Start artist radio",
+                false,
+            )
+            .clicked()
+            {
                 radio = true;
                 ui.close_menu();
             }
@@ -2179,12 +2298,14 @@ impl PlayerApp {
                 toggle_follow = true;
                 ui.close_menu();
             }
-            if ui.button("♙  Open artist page").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("person"), "Open artist page", false)
+                .clicked()
+            {
                 open = true;
                 ui.close_menu();
             }
             if !playlist_names.is_empty() {
-                ui.menu_button("＋  Add artist to playlist", |ui| {
+                ui.menu_button("Add artist to playlist", |ui| {
                     for (playlist_index, name) in playlist_names.iter().enumerate() {
                         if ui.button(name).clicked() {
                             add_to_playlist = Some(playlist_index);
@@ -2193,16 +2314,31 @@ impl PlayerApp {
                     }
                 });
             }
-            if ui.button("＋  Create playlist from artist").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("add"),
+                "Create playlist from artist",
+                false,
+            )
+            .clicked()
+            {
                 create_playlist = true;
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("▤  Copy artist name").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("copy"), "Copy artist name", false).clicked()
+            {
                 ui.ctx().copy_text(artist.clone());
                 ui.close_menu();
             }
-            if ui.button("▤  Copy all artist file paths").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("copy"),
+                "Copy all artist file paths",
+                false,
+            )
+            .clicked()
+            {
                 let listing = tracks
                     .iter()
                     .filter_map(|&index| {
@@ -2216,7 +2352,14 @@ impl PlayerApp {
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("◷  Clear artist listening history").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("history"),
+                "Clear artist listening history",
+                false,
+            )
+            .clicked()
+            {
                 clear_history = true;
                 ui.close_menu();
             }
@@ -2337,7 +2480,9 @@ impl PlayerApp {
                 play = true;
                 ui.close_menu();
             }
-            if ui.button("🔀  Shuffle and play").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle and play", false)
+                .clicked()
+            {
                 shuffle = true;
                 ui.close_menu();
             }
@@ -2345,12 +2490,16 @@ impl PlayerApp {
                 enqueue = true;
                 ui.close_menu();
             }
-            if ui.button("＋  Save mix as playlist").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("add"), "Save mix as playlist", false)
+                .clicked()
+            {
                 create_playlist = true;
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("▤  Copy mix track list").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("copy"), "Copy mix track list", false)
+                .clicked()
+            {
                 let listing = card
                     .tracks
                     .iter()
@@ -2365,7 +2514,14 @@ impl PlayerApp {
                 ui.close_menu();
             }
             ui.separator();
-            if ui.button("◷  Clear these tracks from history").clicked() {
+            if icon_text_button(
+                ui,
+                self.ui_icons.get("history"),
+                "Clear these tracks from history",
+                false,
+            )
+            .clicked()
+            {
                 clear_history = true;
                 ui.close_menu();
             }
@@ -3993,13 +4149,16 @@ impl PlayerApp {
                         },
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let icon_button = |label: &str| {
-                            egui::Button::new(label)
-                                .min_size(Vec2::new(40.0, 40.0))
-                                .frame(false)
+                        let icon_button = |icon: &str| {
+                            egui::Button::image(
+                                egui::Image::new(&self.ui_icons[icon])
+                                    .fit_to_exact_size(Vec2::splat(18.0)),
+                            )
+                            .min_size(Vec2::new(40.0, 40.0))
+                            .frame(false)
                         };
                         if ui
-                            .add(icon_button("⋯"))
+                            .add(icon_button("more"))
                             .on_hover_text("Add to queue")
                             .clicked()
                         {
@@ -4008,21 +4167,21 @@ impl PlayerApp {
                         if self.page == Page::Playlists
                             && self.selected_playlist.is_some()
                             && ui
-                                .add(icon_button("＋"))
+                                .add(icon_button("add"))
                                 .on_hover_text("Add to playlist")
                                 .clicked()
                         {
                             add_to_playlist = true;
                         }
                         if ui
-                            .add(icon_button("×"))
+                            .add(icon_button("library_books"))
                             .on_hover_text("Remove from library; keeps the file")
                             .clicked()
                         {
                             remove = true;
                         }
                         if ui
-                            .add(icon_button("🗑"))
+                            .add(icon_button("delete"))
                             .on_hover_text("Delete audio file permanently")
                             .clicked()
                         {
@@ -5265,7 +5424,9 @@ impl PlayerApp {
                 ui.label(RichText::new("Albums").strong().size(18.0));
                 ui.horizontal_wrapped(|ui| {
                     for (album, _) in albums {
-                        if ui.button(format!("▣  {album}")).clicked() {
+                        if icon_text_button(ui, self.ui_icons.get("album"), album.as_str(), false)
+                            .clicked()
+                        {
                             self.selected_album = Some(album);
                             self.page = Page::AlbumDetail;
                         }
@@ -5284,7 +5445,9 @@ impl PlayerApp {
                 ui.label(RichText::new("Artists").strong().size(18.0));
                 ui.horizontal_wrapped(|ui| {
                     for artist in artists {
-                        if ui.button(format!("♙  {artist}")).clicked() {
+                        if icon_text_button(ui, self.ui_icons.get("person"), &artist, false)
+                            .clicked()
+                        {
                             self.selected_artist = Some(artist);
                             self.page = Page::ArtistDetail;
                         }
@@ -6486,7 +6649,9 @@ impl PlayerApp {
                 albums.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
                 let mut album_open = None;
                 for album in albums.iter().take(12) {
-                    if ui.button(format!("▣  {album}")).clicked() {
+                    if icon_text_button(ui, self.ui_icons.get("album"), album.as_str(), false)
+                        .clicked()
+                    {
                         album_open = Some(album.clone());
                     }
                 }
@@ -6794,7 +6959,7 @@ impl PlayerApp {
                         ui.set_min_width(popup_width);
                         ui.set_max_width(popup_width);
                         ui.horizontal(|ui| {
-                            if let Some(icon) = self.ui_icons.get("songs") {
+                            if let Some(icon) = self.ui_icons.get("search") {
                                 ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(21.0)));
                             }
                             ui.label(RichText::new("Search").size(19.0).strong());
@@ -7966,7 +8131,11 @@ impl PlayerApp {
                                 save_as_playlist = ui
                                     .add_sized(
                                         [152.0, 30.0],
-                                        egui::Button::new("＋  Save as playlist"),
+                                        egui::Button::image_and_text(
+                                            egui::Image::new(&self.ui_icons["add"])
+                                                .fit_to_exact_size(Vec2::splat(16.0)),
+                                            "Save as playlist",
+                                        ),
                                     )
                                     .clicked();
                             }
@@ -8217,7 +8386,10 @@ impl PlayerApp {
                                                 reaction = Some((index, false));
                                             }
                                             if ui
-                                                .small_button("🗑")
+                                                .add(egui::Button::image(
+                                                    egui::Image::new(&self.ui_icons["delete"])
+                                                        .fit_to_exact_size(Vec2::splat(16.0)),
+                                                ))
                                                 .on_hover_text("Delete audio file")
                                                 .clicked()
                                             {
@@ -8289,18 +8461,32 @@ impl PlayerApp {
                 play = true;
             }
             if ui
-                .add_enabled(!tracks.is_empty(), egui::Button::new("🔀  Shuffle"))
+                .add_enabled(
+                    !tracks.is_empty(),
+                    egui::Button::image_and_text(
+                        egui::Image::new(&self.ui_icons["shuffle"])
+                            .fit_to_exact_size(Vec2::splat(18.0)),
+                        "Shuffle",
+                    ),
+                )
                 .clicked()
             {
                 shuffle = true;
             }
             if ui
-                .add_enabled(!tracks.is_empty(), egui::Button::new("♫  Add to queue"))
+                .add_enabled(
+                    !tracks.is_empty(),
+                    egui::Button::image_and_text(
+                        egui::Image::new(&self.ui_icons["add_to_queue"])
+                            .fit_to_exact_size(Vec2::splat(18.0)),
+                        "Add to queue",
+                    ),
+                )
                 .clicked()
             {
                 enqueue = true;
             }
-            if ui.button("＋  Add now playing").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("add"), "Add now playing", false).clicked() {
                 add_now_playing = true;
             }
         });
@@ -8347,7 +8533,7 @@ impl PlayerApp {
                 [300.0, 34.0],
                 egui::TextEdit::singleline(&mut self.playlist_name).hint_text("New playlist name"),
             );
-            if ui.button("＋ Create playlist").clicked() {
+            if icon_text_button(ui, self.ui_icons.get("add"), "Create playlist", false).clicked() {
                 let name = self.playlist_name.trim().to_string();
                 if !name.is_empty() {
                     self.playlists.push(Playlist {
@@ -8392,7 +8578,9 @@ impl PlayerApp {
                         open = Some(index);
                         play = true;
                     }
-                    if ui.small_button("🔀 Shuffle").clicked() {
+                    if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle", false)
+                        .clicked()
+                    {
                         open = Some(index);
                         shuffle_play = true;
                     }
@@ -8407,7 +8595,9 @@ impl PlayerApp {
                     play = true;
                     ui.close_menu();
                 }
-                if ui.button("🔀  Shuffle and play").clicked() {
+                if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle and play", false)
+                    .clicked()
+                {
                     open = Some(index);
                     shuffle_play = true;
                     ui.close_menu();
@@ -8417,12 +8607,16 @@ impl PlayerApp {
                     enqueue = true;
                     ui.close_menu();
                 }
-                if ui.button("⏭  Play playlist next").clicked() {
+                if icon_text_button(ui, self.ui_icons.get("next"), "Play playlist next", false)
+                    .clicked()
+                {
                     open = Some(index);
                     play_next = true;
                     ui.close_menu();
                 }
-                if ui.button("▤  Copy track list").clicked() {
+                if icon_text_button(ui, self.ui_icons.get("copy"), "Copy track list", false)
+                    .clicked()
+                {
                     copy_track_list = Some(index);
                     ui.close_menu();
                 }
@@ -8430,7 +8624,7 @@ impl PlayerApp {
                     export = Some(index);
                     ui.close_menu();
                 }
-                if ui.button("🧹  Remove missing tracks").clicked() {
+                if ui.button("Remove missing tracks").clicked() {
                     remove_missing = Some(index);
                     ui.close_menu();
                 }
@@ -8446,7 +8640,14 @@ impl PlayerApp {
                     duplicate = Some(index);
                     ui.close_menu();
                 }
-                if ui.button("＋  Add currently playing song").clicked() {
+                if icon_text_button(
+                    ui,
+                    self.ui_icons.get("add"),
+                    "Add currently playing song",
+                    false,
+                )
+                .clicked()
+                {
                     add_playing_to_playlist = Some(index);
                     ui.close_menu();
                 }
@@ -8872,7 +9073,7 @@ impl PlayerApp {
                         });
                     }
                     ui.horizontal(|ui| {
-                        if ui.button("＋ Add folder").clicked() {
+                        if icon_text_button(ui, self.ui_icons.get("add"), "Add folder", false).clicked() {
                             self.add_folder();
                         }
                         if ui.button("↻ Rescan").clicked() {
@@ -9814,6 +10015,39 @@ impl PlayerApp {
                 "arrow_up",
                 include_bytes!("../assets/icons/ic-keyboard-arrow-up-24px.svg"),
             ),
+            ("add", include_bytes!("../assets/icons/ic-add-24px.svg")),
+            (
+                "queue",
+                include_bytes!("../assets/icons/ic-queue-music-24px.svg"),
+            ),
+            (
+                "copy",
+                include_bytes!("../assets/icons/ic-content-copy-24px.svg"),
+            ),
+            (
+                "open_in_new",
+                include_bytes!("../assets/icons/ic-open-in-new-24px.svg"),
+            ),
+            (
+                "folder_open",
+                include_bytes!("../assets/icons/ic-folder-open-24px.svg"),
+            ),
+            (
+                "music_note",
+                include_bytes!("../assets/icons/ic-music-note-24px.svg"),
+            ),
+            (
+                "add_to_queue",
+                include_bytes!("../assets/icons/ic-add-to-queue-24px.svg"),
+            ),
+            (
+                "more",
+                include_bytes!("../assets/icons/ic-more-vert-24px.svg"),
+            ),
+            (
+                "delete",
+                include_bytes!("../assets/icons/ic-delete-24px.svg"),
+            ),
         ];
         for (name, bytes) in ICONS {
             if self.ui_icons.contains_key(name) {
@@ -10467,12 +10701,15 @@ impl eframe::App for PlayerApp {
                     });
                     }
                     ui.add_space(4.0);
+                    if let Some(icon) = self.ui_icons.get("search") {
+                        ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)));
+                    }
                     let search_width = ui.available_width().clamp(170.0, 300.0);
                     let search_response = ui.add_sized(
                         [search_width, 34.0],
                         egui::TextEdit::singleline(&mut self.query)
                             .id(egui::Id::new("global-search"))
-                            .hint_text("⌕  Search your library…"),
+                            .hint_text("Search your library…"),
                     );
                     if search_response.changed() {
                         self.search_suggestions_open = !self.query.trim().is_empty();
@@ -10494,18 +10731,23 @@ impl eframe::App for PlayerApp {
                         search_response.surrender_focus();
                     }
                     search_rect = Some(search_response.rect);
-                    if ui
-                        .selectable_label(
-                            !self.queue_collapsed,
-                            format!("♫ Queue  {}", self.queue.len()),
-                        )
+                    if icon_text_button(
+                        ui,
+                        self.ui_icons.get("queue"),
+                        format!("Queue  {}", self.queue.len()),
+                        !self.queue_collapsed,
+                    )
                         .clicked()
                     {
                         self.queue_collapsed = !self.queue_collapsed;
                         self.save_state();
                     }
-                    if ui
-                        .selectable_label(self.page == Page::Settings, "⚙ Settings")
+                    if icon_text_button(
+                        ui,
+                        self.ui_icons.get("settings"),
+                        "Settings",
+                        self.page == Page::Settings,
+                    )
                         .clicked()
                     {
                         self.page = Page::Settings;
@@ -10520,11 +10762,7 @@ impl eframe::App for PlayerApp {
                         }
                         let maximized =
                             ctx.input(|input| input.viewport().maximized.unwrap_or(false));
-                        if ui
-                            .add_sized(
-                                [42.0, 34.0],
-                                egui::Button::new(if maximized { "❐" } else { "□" }),
-                            )
+                        if add_window_state_button(ui, maximized)
                             .on_hover_text(if maximized { "Restore" } else { "Maximize" })
                             .clicked()
                         {
@@ -10662,7 +10900,13 @@ impl eframe::App for PlayerApp {
                                 egui::Layout::right_to_left(egui::Align::Center),
                                 |ui| {
                                     if ui
-                                        .add_sized([34.0, 32.0], egui::Button::new("＋"))
+                                        .add_sized(
+                                            [34.0, 32.0],
+                                            egui::Button::image(
+                                                egui::Image::new(&self.ui_icons["add"])
+                                                    .fit_to_exact_size(Vec2::splat(18.0)),
+                                            ),
+                                        )
                                         .on_hover_text("Create a playlist")
                                         .clicked()
                                     {
@@ -10741,8 +10985,11 @@ impl eframe::App for PlayerApp {
                         }
                     });
                     ui.horizontal(|ui| {
+                        if let Some(icon) = self.ui_icons.get("shuffle") {
+                            ui.add(egui::Image::new(icon).fit_to_exact_size(Vec2::splat(18.0)));
+                        }
                         if ui
-                            .selectable_label(self.shuffle, "🔀 Shuffle")
+                            .selectable_label(self.shuffle, "Shuffle")
                             .on_hover_text("Toggle queue shuffle")
                             .clicked()
                         {
@@ -10851,7 +11098,7 @@ impl eframe::App for PlayerApp {
                                         restart_now_playing = true;
                                         ui.close_menu();
                                     }
-                                    if ui.button("⏭  Skip to next track").clicked() {
+                                    if icon_text_button(ui, self.ui_icons.get("next"), "Skip to next track", false).clicked() {
                                         skip_now_playing = true;
                                         ui.close_menu();
                                     }
@@ -10865,16 +11112,16 @@ impl eframe::App for PlayerApp {
                                         ui.close_menu();
                                     }
                                     ui.separator();
-                                    if ui.button("▤  Copy song title and artist").clicked() {
+                                    if icon_text_button(ui, self.ui_icons.get("copy"), "Copy song title and artist", false).clicked() {
                                         ui.ctx().copy_text(format!("{} — {}", title, artist));
                                         ui.close_menu();
                                     }
-                                    if ui.button("▣  Copy file path").clicked() {
+                                    if icon_text_button(ui, self.ui_icons.get("copy"), "Copy file path", false).clicked() {
                                         ui.ctx().copy_text(current_path.to_string_lossy().into_owned());
                                         ui.close_menu();
                                     }
                                     #[cfg(target_os = "windows")]
-                                    if ui.button("📂  Show in File Explorer").clicked() {
+                                    if icon_text_button(ui, self.ui_icons.get("folder_open"), "Show in File Explorer", false).clicked() {
                                         reveal_path_in_explorer(&current_path);
                                         ui.close_menu();
                                     }
@@ -11058,11 +11305,11 @@ impl eframe::App for PlayerApp {
                                             queue_dislike = Some(track_index);
                                             ui.close_menu();
                                         }
-                                        if ui.button("▤  Copy song title and artist").clicked() {
+                                        if icon_text_button(ui, self.ui_icons.get("copy"), "Copy song title and artist", false).clicked() {
                                             ui.ctx().copy_text(format!("{} — {}", track_title, track_artist));
                                             ui.close_menu();
                                         }
-                                        if ui.button("▣  Copy file path").clicked() {
+                                        if icon_text_button(ui, self.ui_icons.get("copy"), "Copy file path", false).clicked() {
                                             ui.ctx().copy_text(queue_track_path.to_string_lossy().into_owned());
                                             ui.close_menu();
                                         }
