@@ -1,6 +1,6 @@
 [package]
 name = "lilt-player"
-version = "0.2.18"
+version = "0.2.29"
 edition = "2021"
 authors = ["SupremyTommy"]
 repository = "https://github.com/SupremyTommy/Lilt"

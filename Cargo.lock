@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "lilt-player"
-version = "0.2.18"
+version = "0.2.29"
 dependencies = [
  "directories",
  "eframe",
