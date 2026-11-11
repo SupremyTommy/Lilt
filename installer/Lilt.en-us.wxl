@@ -1,0 +1,29 @@
+<WixLocalization Culture="en-US" Codepage="1252" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="WixUINext" Value="&amp;Next" />
+  <String Id="WixUIBack" Value="&amp;Back" />
+  <String Id="WixUICancel" Value="Cancel" />
+  <String Id="WixUIFinish" Value="&amp;Finish" />
+  <String Id="LiltWelcomeDlg_Title" Value="Lilt Setup" />
+  <String Id="LiltWelcomeDlgBitmap" Value="WixUI_Bmp_Dialog" />
+  <String Id="LiltWelcomeTitle" Value="{\WixUI_Font_Bigger}Welcome to Lilt" />
+  <String Id="LiltWelcomeDescription" Value="Set up Lilt for your Windows account. Choose the shortcuts and Windows integrations you want, then select where to install." />
+  <String Id="LiltUpdateTitle" Value="{\WixUI_Font_Bigger}Welcome back to Lilt" />
+  <String Id="LiltUpdateDescription" Value="A newer version is ready. Setup detected Lilt on this PC and will update it. Your music library and preferences are stored separately and will stay in place." />
+  <String Id="LiltOptionsDlg_Title" Value="Lilt Setup" />
+  <String Id="LiltOptionsBannerBitmap" Value="WixUI_Bmp_Banner" />
+  <String Id="LiltOptionsTitle" Value="{\WixUI_Font_Title}Choose your Lilt options" />
+  <String Id="LiltOptionsDescription" Value="Select what Setup should add. You can change your default app in Windows at any time." />
+  <String Id="LiltOptionStartMenu" Value="Add a Start Menu (Programs) shortcut" />
+  <String Id="LiltOptionDesktop" Value="Add a Desktop shortcut" />
+  <String Id="LiltOptionExplorer" Value="Add “Open folder with Lilt” to File Explorer" />
+  <String Id="LiltOptionAudioTypes" Value="Register supported music file types with Windows" />
+  <String Id="LiltOptionAudioTypesNote" Value="Registration makes Lilt available in Open with and default-app choices. It does not change your current default player." />
+  <String Id="FeaturesDlg_Title" Value="Lilt Setup" />
+  <String Id="FeaturesDlgTree" Value="Lilt options" />
+  <String Id="FeaturesDlgDescription" Value="Choose the optional shortcuts and Windows integrations to install." />
+  <String Id="InstallDirDlg_Title" Value="Lilt Setup" />
+  <String Id="InstallDirDlgTitle" Value="{\WixUI_Font_Title}Choose where to install Lilt" />
+  <String Id="InstallDirDlgDescription" Value="Lilt will be installed for your Windows account. Keep the suggested folder or choose another location." />
+  <String Id="ExitDialogDescription" Value="Your music is ready. Thank you for choosing Lilt." />
+  <String Id="ExitDialogTitle" Value="{\WixUI_Font_Bigger}Thank you for installing Lilt" />
+</WixLocalization>

@@ -1,23 +1,38 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
-  <Package Name="Lilt" Manufacturer="UltimateBloxStudium"
-           Version="0.2.17" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
+  <Package Name="Lilt" Manufacturer="SupremyTommy"
+           Version="0.2.18" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
            Scope="perUser" InstallerVersion="500">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lilt is already installed." />
     <MediaTemplate EmbedCab="yes" />
     <Icon Id="LiltIcon" SourceFile="assets/app_icon.ico" />
     <Property Id="ARPPRODUCTICON" Value="LiltIcon" />
-    <ui:WixUI Id="WixUI_Minimal" />
+    <UIRef Id="LiltSetupUI" />
+    <WixVariable Id="WixUIDialogBmp" Value="installer/assets/LiltWelcome.png" />
+    <WixVariable Id="WixUIBannerBmp" Value="installer/assets/LiltBanner.png" />
+    <Property Id="WIXUI_INSTALLDIR" Value="INSTALLFOLDER" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOX" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALCHECKBOXTEXT" Value="Launch Lilt" />
+    <Property Id="LILT_STARTMENU" Value="1" />
+    <Property Id="LILT_DESKTOP" Value="1" />
+    <Property Id="LILT_EXPLORER" Value="1" />
+    <Property Id="LILT_AUDIOTYPES" Value="1" />
+    <Property Id="WIXUI_EXITDIALOGOPTIONALTEXT" Value="Thanks for choosing Lilt. Created by SupremyTommy." />
+    <CustomAction Id="LaunchLilt" FileRef="LiltExe" ExeCommand="" Execute="immediate" Impersonate="yes" Return="asyncNoWait" />
     <Feature Id="MainFeature" Title="Lilt" Level="1">
       <ComponentGroupRef Id="LiltFiles" />
-      <ComponentRef Id="LiltExplorerBackground" />
-      <ComponentRef Id="LiltFileAssociations" />
-    </Feature>
-    <Feature Id="StartMenuShortcutFeature" Title="Start Menu shortcut" Description="Add Lilt to the Start Menu." Level="1">
-      <ComponentRef Id="StartMenuShortcutComponent" />
-    </Feature>
-    <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="Add a Lilt shortcut to the Desktop." Level="1">
-      <ComponentRef Id="DesktopShortcutComponent" />
+      <Feature Id="StartMenuShortcutFeature" Title="Start Menu (Programs) shortcut" Description="Add Lilt to the Start Menu." Level="1">
+        <ComponentRef Id="StartMenuShortcutComponent" />
+      </Feature>
+      <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="Add Lilt to the Desktop." Level="1">
+        <ComponentRef Id="DesktopShortcutComponent" />
+      </Feature>
+      <Feature Id="ExplorerContextMenuFeature" Title="File Explorer context menu" Description="Add Open folder with Lilt to folder background menus." Level="1">
+        <ComponentRef Id="LiltExplorerBackground" />
+      </Feature>
+      <Feature Id="AudioFileRegistrationFeature" Title="Windows audio file registration" Description="Make Lilt available in Windows Open with and default-app choices for supported audio files. This does not change your current default player." Level="1">
+        <ComponentRef Id="LiltFileAssociations" />
+      </Feature>
     </Feature>
   </Package>
 
@@ -26,17 +41,17 @@
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Lilt">
           <Component Id="LiltExecutable" Guid="*">
-            <File Id="LiltExe" Source="dist/Lilt-v0.2.17-windows-x64/lilt-player.exe" KeyPath="yes" />
-            <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="Installed" Type="integer" Value="1" />
+            <File Id="LiltExe" Source="dist/Lilt-v0.2.18-windows-x64/lilt-player.exe" KeyPath="yes" />
+            <RegistryValue Root="HKCU" Key="Software\SupremyTommy\Lilt" Name="Installed" Type="integer" Value="1" />
           </Component>
           <Component Id="LiltPngIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.17-windows-x64/app_icon.png" />
+            <File Source="dist/Lilt-v0.2.18-windows-x64/app_icon.png" />
           </Component>
           <Component Id="LiltIcoIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.17-windows-x64/app_icon.ico" />
+            <File Source="dist/Lilt-v0.2.18-windows-x64/app_icon.ico" />
           </Component>
           <Component Id="LiltReadme" Guid="*">
-            <File Source="dist/Lilt-v0.2.17-windows-x64/README.md" />
+            <File Source="dist/Lilt-v0.2.18-windows-x64/README.md" />
           </Component>
           <Component Id="LiltExplorerBackground" Guid="*">
             <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer">
@@ -49,14 +64,14 @@
           </Component>
           <Component Id="LiltFileAssociations" Guid="*">
             <RegistryKey Root="HKCU" Key="Software\RegisteredApplications">
-              <RegistryValue Name="Lilt" Type="string" Value="Software\UltimateBloxStudium\Lilt\Capabilities" />
+              <RegistryValue Name="Lilt" Type="string" Value="Software\SupremyTommy\Lilt\Capabilities" />
             </RegistryKey>
-            <RegistryKey Root="HKCU" Key="Software\UltimateBloxStudium\Lilt\Capabilities">
+            <RegistryKey Root="HKCU" Key="Software\SupremyTommy\Lilt\Capabilities">
               <RegistryValue Name="ApplicationName" Type="string" Value="Lilt" />
               <RegistryValue Name="ApplicationDescription" Type="string" Value="Lilt music player" />
               <RegistryValue Name="ApplicationIcon" Type="string" Value="[#LiltExe],0" />
             </RegistryKey>
-            <RegistryKey Root="HKCU" Key="Software\UltimateBloxStudium\Lilt\Capabilities\FileAssociations">
+            <RegistryKey Root="HKCU" Key="Software\SupremyTommy\Lilt\Capabilities\FileAssociations">
               <RegistryValue Name=".mp3" Type="string" Value="Lilt.Audio" />
               <RegistryValue Name=".flac" Type="string" Value="Lilt.Audio" />
               <RegistryValue Name=".wav" Type="string" Value="Lilt.Audio" />
@@ -89,14 +104,14 @@
       <Component Id="StartMenuShortcutComponent" Guid="*">
         <Shortcut Id="StartMenuShortcut" Name="Lilt" Target="[#LiltExe]"
                   WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
-        <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="StartMenuShortcut" Type="integer" Value="1" />
+        <RegistryValue Root="HKCU" Key="Software\SupremyTommy\Lilt" Name="StartMenuShortcut" Type="integer" Value="1" />
       </Component>
     </DirectoryRef>
     <StandardDirectory Id="DesktopFolder">
       <Component Id="DesktopShortcutComponent" Guid="*">
         <Shortcut Id="DesktopShortcut" Name="Lilt" Target="[#LiltExe]"
                   WorkingDirectory="INSTALLFOLDER" Advertise="no" Icon="LiltIcon" />
-        <RegistryValue Root="HKCU" Key="Software\UltimateBloxStudium\Lilt" Name="DesktopShortcut" Type="integer" Value="1" />
+        <RegistryValue Root="HKCU" Key="Software\SupremyTommy\Lilt" Name="DesktopShortcut" Type="integer" Value="1" />
       </Component>
     </StandardDirectory>
   </Fragment>
@@ -108,5 +123,105 @@
       <ComponentRef Id="LiltIcoIcon" />
       <ComponentRef Id="LiltReadme" />
     </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <!-- A branded first-run flow with no placeholder license page. -->
+    <UI Id="LiltSetupUI">
+      <TextStyle Id="LiltUIFontNormal" FaceName="Segoe UI" Size="9" />
+      <TextStyle Id="LiltUIFontBigger" FaceName="Segoe UI" Size="12" />
+      <TextStyle Id="LiltUIFontTitle" FaceName="Segoe UI" Size="9" Bold="yes" />
+      <Property Id="DefaultUIFont" Value="LiltUIFontNormal" />
+      <DialogRef Id="FeaturesDlg" />
+      <DialogRef Id="InstallDirDlg" />
+      <DialogRef Id="VerifyReadyDlg" />
+      <DialogRef Id="ExitDialog" />
+      <DialogRef Id="MaintenanceWelcomeDlg" />
+      <DialogRef Id="MaintenanceTypeDlg" />
+      <DialogRef Id="BrowseDlg" />
+      <DialogRef Id="DiskCostDlg" />
+      <DialogRef Id="ErrorDlg" />
+      <DialogRef Id="FatalError" />
+      <DialogRef Id="FilesInUse" />
+      <DialogRef Id="MsiRMFilesInUse" />
+      <DialogRef Id="PrepareDlg" />
+      <DialogRef Id="ProgressDlg" />
+      <DialogRef Id="ResumeDlg" />
+      <DialogRef Id="UserExit" />
+
+      <Publish Dialog="ExitDialog" Control="Finish" Event="EndDialog" Value="Return" Order="999" />
+      <Publish Dialog="ExitDialog" Control="Finish" Event="DoAction" Value="LaunchLilt" Order="1" Condition="WIXUI_EXITDIALOGOPTIONALCHECKBOX = 1 AND NOT Installed" />
+      <Dialog Id="LiltWelcomeDlg" Width="370" Height="270" Title="!(loc.LiltWelcomeDlg_Title)">
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="LiltOptionsDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="Bitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="234" TabSkip="no" Text="!(loc.LiltWelcomeDlgBitmap)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="!(loc.WixUIBack)" />
+        <Control Id="TitleNew" Type="Text" X="135" Y="20" Width="220" Height="48" Transparent="yes" NoPrefix="yes" Text="!(loc.LiltWelcomeTitle)" ShowCondition="NOT WIX_UPGRADE_DETECTED" HideCondition="WIX_UPGRADE_DETECTED" />
+        <Control Id="DescriptionNew" Type="Text" X="135" Y="78" Width="220" Height="125" Transparent="yes" NoPrefix="yes" Text="!(loc.LiltWelcomeDescription)" ShowCondition="NOT WIX_UPGRADE_DETECTED" HideCondition="WIX_UPGRADE_DETECTED" />
+        <Control Id="TitleUpdate" Type="Text" X="135" Y="20" Width="220" Height="48" Transparent="yes" NoPrefix="yes" Text="!(loc.LiltUpdateTitle)" ShowCondition="WIX_UPGRADE_DETECTED" HideCondition="NOT WIX_UPGRADE_DETECTED" />
+        <Control Id="DescriptionUpdate" Type="Text" X="135" Y="78" Width="220" Height="125" Transparent="yes" NoPrefix="yes" Text="!(loc.LiltUpdateDescription)" ShowCondition="WIX_UPGRADE_DETECTED" HideCondition="NOT WIX_UPGRADE_DETECTED" />
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="373" Height="0" />
+      </Dialog>
+      <Dialog Id="LiltOptionsDlg" Width="370" Height="270" Title="!(loc.LiltOptionsDlg_Title)">
+        <Control Id="BannerBitmap" Type="Bitmap" X="0" Y="0" Width="370" Height="44" TabSkip="no" Text="!(loc.LiltOptionsBannerBitmap)" />
+        <Control Id="BannerLine" Type="Line" X="0" Y="44" Width="373" Height="0" />
+        <Control Id="Title" Type="Text" X="15" Y="6" Width="300" Height="18" Transparent="yes" NoPrefix="yes" Text="!(loc.LiltOptionsTitle)" />
+        <Control Id="Description" Type="Text" X="20" Y="54" Width="330" Height="28" NoPrefix="yes" Text="!(loc.LiltOptionsDescription)" />
+        <Control Id="StartMenu" Type="CheckBox" X="24" Y="88" Width="325" Height="18" Property="LILT_STARTMENU" CheckBoxValue="1" Text="!(loc.LiltOptionStartMenu)">
+          <Publish Event="AddLocal" Value="StartMenuShortcutFeature" Condition="LILT_STARTMENU" />
+          <Publish Event="Remove" Value="StartMenuShortcutFeature" Condition="NOT LILT_STARTMENU" />
+        </Control>
+        <Control Id="Desktop" Type="CheckBox" X="24" Y="113" Width="325" Height="18" Property="LILT_DESKTOP" CheckBoxValue="1" Text="!(loc.LiltOptionDesktop)">
+          <Publish Event="AddLocal" Value="DesktopShortcutFeature" Condition="LILT_DESKTOP" />
+          <Publish Event="Remove" Value="DesktopShortcutFeature" Condition="NOT LILT_DESKTOP" />
+        </Control>
+        <Control Id="Explorer" Type="CheckBox" X="24" Y="138" Width="325" Height="18" Property="LILT_EXPLORER" CheckBoxValue="1" Text="!(loc.LiltOptionExplorer)">
+          <Publish Event="AddLocal" Value="ExplorerContextMenuFeature" Condition="LILT_EXPLORER" />
+          <Publish Event="Remove" Value="ExplorerContextMenuFeature" Condition="NOT LILT_EXPLORER" />
+        </Control>
+        <Control Id="AudioTypes" Type="CheckBox" X="24" Y="163" Width="325" Height="18" Property="LILT_AUDIOTYPES" CheckBoxValue="1" Text="!(loc.LiltOptionAudioTypes)">
+          <Publish Event="AddLocal" Value="AudioFileRegistrationFeature" Condition="LILT_AUDIOTYPES" />
+          <Publish Event="Remove" Value="AudioFileRegistrationFeature" Condition="NOT LILT_AUDIOTYPES" />
+        </Control>
+        <Control Id="AudioTypesNote" Type="Text" X="44" Y="184" Width="305" Height="34" NoPrefix="yes" Text="!(loc.LiltOptionAudioTypesNote)" />
+        <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Text="!(loc.WixUIBack)">
+          <Publish Event="NewDialog" Value="LiltWelcomeDlg" />
+        </Control>
+        <Control Id="Next" Type="PushButton" X="236" Y="243" Width="56" Height="17" Default="yes" Text="!(loc.WixUINext)">
+          <Publish Event="NewDialog" Value="InstallDirDlg" />
+        </Control>
+        <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Cancel="yes" Text="!(loc.WixUICancel)">
+          <Publish Event="SpawnDialog" Value="CancelDlg" />
+        </Control>
+        <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="373" Height="0" />
+      </Dialog>
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="LiltOptionsDlg" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="CheckTargetPath" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="SetTargetPath" Value="[WIXUI_INSTALLDIR]" Order="3" />
+      <Publish Dialog="InstallDirDlg" Control="Next" Event="NewDialog" Value="VerifyReadyDlg" Order="4" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Property="_BrowseProperty" Value="[WIXUI_INSTALLDIR]" Order="1" />
+      <Publish Dialog="InstallDirDlg" Control="ChangeFolder" Event="SpawnDialog" Value="BrowseDlg" Order="2" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="SetTargetPath" Value="[_BrowseProperty]" Order="3" />
+      <Publish Dialog="BrowseDlg" Control="OK" Event="EndDialog" Value="Return" Order="4" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Condition="NOT Installed" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="MaintenanceTypeDlg" Condition="Installed AND NOT PATCH" />
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Condition="Installed AND PATCH" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="FeaturesDlg" />
+
+      <InstallUISequence>
+        <Show Dialog="override WelcomeDlg" Before="ProgressDlg" Condition="0" />
+        <Show Dialog="LiltWelcomeDlg" Before="ProgressDlg" Condition="NOT Installed OR PATCH" />
+      </InstallUISequence>
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="MaintenanceTypeDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="VerifyReadyDlg" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="MaintenanceWelcomeDlg" />
+
+    </UI>
+    <UIRef Id="WixUI_Common" />
   </Fragment>
 </Wix>

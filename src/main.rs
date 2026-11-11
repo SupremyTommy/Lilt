@@ -13526,7 +13526,7 @@ const GOOGLE_AI_KEY_TARGET: &str = "Lilt.GoogleAI.ApiKey";
 const LILT_USER_AGENT: &str = concat!(
     "LiltPlayer/",
     env!("CARGO_PKG_VERSION"),
-    " (https://github.com/ultimatebloxstudium-tech/Lilt)"
+    " (https://github.com/SupremyTommy/Lilt)"
 );
 
 fn compact_metadata(value: &str, limit: usize) -> String {
@@ -13971,7 +13971,7 @@ fn is_newer_version(candidate: &str, current: &str) -> bool {
 fn check_for_update() -> Result<Option<UpdateInfo>, String> {
     let response = winhttp_get(
         "api.github.com",
-        "/repos/ultimatebloxstudium-tech/Lilt/releases/latest",
+        "/repos/SupremyTommy/Lilt/releases/latest",
         "application/vnd.github+json",
         1024 * 1024,
     )?;
