@@ -382,6 +382,10 @@ struct Track {
     year: u32,
     added: u64,
     duration: f64,
+    #[serde(default)]
+    replay_gain_track_db: Option<f32>,
+    #[serde(default)]
+    replay_gain_album_db: Option<f32>,
     #[serde(skip)]
     artwork: Option<Arc<Vec<u8>>>,
     #[serde(skip)]
@@ -392,6 +396,43 @@ struct Track {
 struct Playlist {
     name: String,
     tracks: Vec<PathBuf>,
+    #[serde(default)]
+    rule: Option<SmartPlaylistRule>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SmartPlaylistRule {
+    #[default]
+    LikedSongs,
+    FollowedArtists,
+    RecentlyAdded,
+    Rediscover,
+    FavoriteGenres,
+}
+
+impl SmartPlaylistRule {
+    fn label(self) -> &'static str {
+        match self {
+            Self::LikedSongs => "Liked songs",
+            Self::FollowedArtists => "Followed artists",
+            Self::RecentlyAdded => "Recently added",
+            Self::Rediscover => "Rediscover",
+            Self::FavoriteGenres => "Favorite genres",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TasteProfileBackup {
+    version: u32,
+    favorite_genres: Vec<String>,
+    liked_artists: Vec<String>,
+    liked_albums: Vec<String>,
+    discovery: f32,
+    prefer_unplayed: bool,
+    recommendation_variety: f32,
+    recommendation_size: usize,
+    use_listening_history: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -417,12 +458,47 @@ enum RepeatMode {
     One,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum SmartQueueMode {
+    #[default]
+    Off,
+    WhenQueueEnds,
+    KeepThreeReady,
+}
+
+impl SmartQueueMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::WhenQueueEnds => "When queue ends",
+            Self::KeepThreeReady => "Keep 3 recommendations ready",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum ReplayGainMode {
+    #[default]
+    Off,
+    Track,
+    Album,
+}
+
+impl ReplayGainMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Off",
+            Self::Track => "Track gain",
+            Self::Album => "Album gain",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 enum NowPlayingTab {
     #[default]
     UpNext,
     ForYou,
-    Visualizer,
     Lyrics,
 }
 
@@ -504,8 +580,12 @@ struct DeletedFingerprintRule {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Preferences {
+    #[serde(default = "legacy_welcome_completed")]
+    welcome_completed: bool,
     #[serde(default)]
     folders: Vec<PathBuf>,
+    #[serde(default)]
+    favorite_genres: HashSet<String>,
     #[serde(default)]
     liked_songs: HashSet<PathBuf>,
     #[serde(default)]
@@ -520,6 +600,8 @@ struct Preferences {
     history: Vec<PathBuf>,
     #[serde(default)]
     track_engagement: HashMap<PathBuf, TrackEngagement>,
+    #[serde(default)]
+    recommendation_feedback: HashMap<PathBuf, i8>,
     #[serde(default)]
     search_history: Vec<String>,
     #[serde(default)]
@@ -536,6 +618,14 @@ struct Preferences {
     shuffle: bool,
     #[serde(default)]
     repeat: RepeatMode,
+    #[serde(default)]
+    smart_queue_mode: SmartQueueMode,
+    #[serde(default = "default_true")]
+    use_listening_history: bool,
+    #[serde(default)]
+    track_fade_seconds: f32,
+    #[serde(default)]
+    replay_gain_mode: ReplayGainMode,
     #[serde(default = "default_discovery")]
     discovery: f32,
     #[serde(default = "default_prefer_unplayed")]
@@ -585,6 +675,12 @@ struct Preferences {
     #[serde(default)]
     daily_mixes: Vec<Vec<PathBuf>>,
     #[serde(default)]
+    session_queue: Vec<PathBuf>,
+    #[serde(default)]
+    session_current: Option<PathBuf>,
+    #[serde(default)]
+    session_position_seconds: f64,
+    #[serde(default)]
     show_queue_on_start: bool,
     #[serde(default = "default_compact_mode")]
     compact_mode: bool,
@@ -611,7 +707,9 @@ struct Preferences {
 impl Default for Preferences {
     fn default() -> Self {
         Self {
+            welcome_completed: false,
             folders: Vec::new(),
+            favorite_genres: HashSet::new(),
             liked_songs: HashSet::new(),
             disliked_songs: HashSet::new(),
             liked_artists: HashSet::new(),
@@ -619,6 +717,7 @@ impl Default for Preferences {
             playlists: Vec::new(),
             history: Vec::new(),
             track_engagement: HashMap::new(),
+            recommendation_feedback: HashMap::new(),
             search_history: Vec::new(),
             excluded_tracks: HashSet::new(),
             view_mode: ViewMode::default(),
@@ -627,6 +726,10 @@ impl Default for Preferences {
             accent: String::new(),
             shuffle: false,
             repeat: RepeatMode::default(),
+            smart_queue_mode: SmartQueueMode::default(),
+            use_listening_history: true,
+            track_fade_seconds: 0.0,
+            replay_gain_mode: ReplayGainMode::Off,
             discovery: default_discovery(),
             prefer_unplayed: default_prefer_unplayed(),
             recommendation_variety: default_recommendation_variety(),
@@ -651,6 +754,9 @@ impl Default for Preferences {
             auto_purge_deleted: default_auto_purge_deleted(),
             scan_rate_per_second: default_scan_rate_per_second(),
             daily_mixes: Vec::new(),
+            session_queue: Vec::new(),
+            session_current: None,
+            session_position_seconds: 0.0,
             show_queue_on_start: false,
             compact_mode: default_compact_mode(),
             start_maximized: default_start_maximized(),
@@ -670,6 +776,11 @@ fn default_discovery() -> f32 {
     0.5
 }
 
+// Existing settings files predate onboarding and should be treated as completed.
+fn legacy_welcome_completed() -> bool {
+    true
+}
+
 fn default_prefer_unplayed() -> bool {
     true
 }
@@ -684,6 +795,34 @@ fn default_recommendation_size() -> usize {
 
 fn default_ai_mix_size() -> usize {
     50
+}
+
+fn playback_fade_gain(position_seconds: f64, duration_seconds: Option<f64>, fade_seconds: f32) -> f32 {
+    let fade_seconds = fade_seconds.clamp(0.0, 8.0) as f64;
+    if fade_seconds <= f64::EPSILON {
+        return 1.0;
+    }
+    let position = if position_seconds.is_finite() { position_seconds.max(0.0) } else { 0.0 };
+    let duration = duration_seconds.filter(|duration| duration.is_finite() && *duration > 0.0);
+    let edge = duration.map_or(fade_seconds, |duration| fade_seconds.min(duration * 0.5));
+    let fade_in = (position / edge).clamp(0.0, 1.0);
+    let fade_out = duration.map_or(1.0, |duration| ((duration - position) / edge).clamp(0.0, 1.0));
+    fade_in.min(fade_out) as f32
+}
+
+fn crossfade_gains(progress: f32) -> (f32, f32) {
+    let angle = progress.clamp(0.0, 1.0) * std::f32::consts::FRAC_PI_2;
+    (angle.cos(), angle.sin())
+}
+
+fn replay_gain_multiplier_from_db(decibels: Option<f32>) -> f32 {
+    decibels.map_or(1.0, |gain| {
+        if gain.is_finite() {
+            10.0_f32.powf(gain.clamp(-18.0, 6.0) / 20.0)
+        } else {
+            1.0
+        }
+    })
 }
 
 fn default_true() -> bool {
@@ -760,6 +899,8 @@ enum Page {
 struct ScanResult {
     tracks: Vec<Track>,
     error: Option<String>,
+    issues: Vec<String>,
+    issue_count: usize,
     auto_deleted_count: usize,
     auto_delete_failures: usize,
     auto_deleted_paths: Vec<PathBuf>,
@@ -879,17 +1020,28 @@ struct HomeJobResult {
     seed: u64,
 }
 
+struct CrossfadeTransition {
+    next_sink: Sink,
+    next_stream: OutputStream,
+    next_queue_position: usize,
+    next_track_index: usize,
+    duration: Duration,
+}
+
 // Owned snapshot of everything the recommendation / mix scoring needs, so the
 // work can run on a background thread without touching the UI state.
 struct MixContext {
     tracks: Vec<Track>,
     history: Vec<PathBuf>,
     track_engagement: HashMap<PathBuf, TrackEngagement>,
+    recommendation_feedback: HashMap<PathBuf, i8>,
+    use_listening_history: bool,
     liked_songs: HashSet<PathBuf>,
     disliked_songs: HashSet<PathBuf>,
     excluded_tracks: HashSet<PathBuf>,
     liked_artists: HashSet<String>,
     liked_albums: HashSet<String>,
+    favorite_genres: HashSet<String>,
     discovery: f32,
     prefer_unplayed: bool,
     recommendation_variety: f32,
@@ -955,15 +1107,20 @@ struct HomeViewCache {
 }
 
 pub struct PlayerApp {
+    welcome_open: bool,
+    welcome_step: u8,
+    welcome_completed: bool,
     tracks: Vec<Track>,
     folders: Vec<PathBuf>,
     liked_songs: HashSet<PathBuf>,
     disliked_songs: HashSet<PathBuf>,
     liked_artists: HashSet<String>,
     liked_albums: HashSet<String>,
+    favorite_genres: HashSet<String>,
     playlists: Vec<Playlist>,
     history: Vec<PathBuf>,
     track_engagement: HashMap<PathBuf, TrackEngagement>,
+    recommendation_feedback: HashMap<PathBuf, i8>,
     excluded_tracks: HashSet<PathBuf>,
     query: String,
     search_history: Vec<String>,
@@ -1031,7 +1188,12 @@ pub struct PlayerApp {
     home_cache_dirty: bool,
     shuffle: bool,
     repeat: RepeatMode,
+    smart_queue_mode: SmartQueueMode,
+    use_listening_history: bool,
+    track_fade_seconds: f32,
+    replay_gain_mode: ReplayGainMode,
     playlist_name: String,
+    smart_playlist_rule: SmartPlaylistRule,
     renaming_playlist: Option<usize>,
     playlist_rename_draft: String,
     selected_playlist: Option<usize>,
@@ -1048,9 +1210,13 @@ pub struct PlayerApp {
     lyrics: Option<String>,
     lyrics_error: Option<String>,
     queue: Vec<usize>,
+    resume_queue_paths: Vec<PathBuf>,
+    resume_current_path: Option<PathBuf>,
+    resume_position_seconds: f64,
     queue_collapsed: bool,
     now_playing_expanded: bool,
     now_playing_tab: NowPlayingTab,
+    session_target_minutes: usize,
     compact_mode: bool,
     start_maximized: bool,
     animations_enabled: bool,
@@ -1062,8 +1228,12 @@ pub struct PlayerApp {
     last_engagement_save: Instant,
     sink: Option<Sink>,
     stream: Option<OutputStream>,
+    crossfade: Option<CrossfadeTransition>,
+    crossfade_unavailable_path: Option<PathBuf>,
     scan_receiver: Option<Receiver<ScanResult>>,
     scan_status: String,
+    scan_issues: Vec<String>,
+    scan_issue_count: usize,
     scan_busy: bool,
     initial_library_loading: bool,
     scan_rate_per_second: usize,

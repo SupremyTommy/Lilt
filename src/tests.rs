@@ -77,6 +77,18 @@ mod tests {
         assert!(preferences.deleted_songs.is_empty());
         assert!(preferences.auto_purge_deleted);
         assert_eq!(preferences.scan_rate_per_second, 5_000);
+        assert_eq!(preferences.smart_queue_mode, SmartQueueMode::Off);
+        assert!(preferences.use_listening_history);
+        assert!(preferences.session_queue.is_empty());
+    }
+
+    #[test]
+    fn older_manual_playlists_load_without_a_smart_rule() {
+        let preferences: Preferences = serde_json::from_str(
+            r#"{"playlists":[{"name":"Old playlist","tracks":["C:/Music/song.mp3"]}]}"#,
+        ).expect("old playlist settings parse");
+        assert_eq!(preferences.playlists.len(), 1);
+        assert!(preferences.playlists[0].rule.is_none());
     }
 
     #[test]
@@ -158,6 +170,30 @@ mod tests {
     }
 
     #[test]
+    fn playlist_play_actions_resolve_tracks_and_explain_empty_playlists() {
+        let first = PathBuf::from("first.mp3");
+        let second = PathBuf::from("second.mp3");
+        let mut app = PlayerApp::new();
+        app.tracks = vec![
+            Track { path: first.clone(), ..Track::default() },
+            Track { path: second.clone(), ..Track::default() },
+        ];
+        app.playlists = vec![
+            Playlist { name: "Ordered list".into(), tracks: vec![second.clone(), first.clone()], rule: None },
+            Playlist { name: "Empty list".into(), tracks: Vec::new(), rule: None },
+        ];
+
+        assert_eq!(app.select_playlist_for_playback(0), [1, 0]);
+        assert!(matches!(app.page, Page::Playlists));
+        assert_eq!(app.selected_playlist, Some(0));
+
+        app.queue = vec![1];
+        assert!(app.select_playlist_for_playback(1).is_empty());
+        assert_eq!(app.queue, [1]);
+        assert!(app.status.contains("Empty list has no available tracks"));
+    }
+
+    #[test]
     fn recommendations_prioritize_unplayed_and_exclude_disliked_tracks() {
         let played = PathBuf::from("played.mp3");
         let unplayed = PathBuf::from("unplayed.mp3");
@@ -189,6 +225,44 @@ mod tests {
         let recommendations = app.compute_recommendations();
         assert_eq!(recommendations.first(), Some(&1));
         assert!(!recommendations.contains(&2));
+    }
+
+    #[test]
+    fn recommendation_feedback_changes_track_and_artist_ranking() {
+        let mut app = PlayerApp::new();
+        app.tracks = vec![
+            Track { path: PathBuf::from("neutral.mp3"), artist: "Neutral Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("feedback.mp3"), artist: "Feedback Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("related.mp3"), artist: "Feedback Artist".into(), ..Track::default() },
+        ];
+        app.prefer_unplayed = false;
+        app.recommendation_feedback.insert(PathBuf::from("feedback.mp3"), 1);
+        let more = app.compute_recommendations();
+        assert_eq!(more.first(), Some(&1));
+        assert!(more.iter().position(|&index| index == 2).unwrap() < more.iter().position(|&index| index == 0).unwrap());
+
+        app.recommendation_feedback.insert(PathBuf::from("feedback.mp3"), -1);
+        let less = app.compute_recommendations();
+        assert_eq!(less.first(), Some(&0));
+        assert!(less.iter().position(|&index| index == 2).unwrap() < less.iter().position(|&index| index == 1).unwrap());
+    }
+
+    #[test]
+    fn listening_history_toggle_removes_history_from_recommendation_scores() {
+        let mut app = PlayerApp::new();
+        app.tracks = vec![
+            Track { path: PathBuf::from("played.mp3"), artist: "Favorite Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("related.mp3"), artist: "Favorite Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("other.mp3"), artist: "Other Artist".into(), ..Track::default() },
+        ];
+        app.prefer_unplayed = false;
+        app.history = vec![PathBuf::from("played.mp3")];
+        let history_based = app.compute_recommendations();
+        app.use_listening_history = false;
+        let history_disabled = app.compute_recommendations();
+        app.history.clear();
+        assert_eq!(history_disabled, app.compute_recommendations());
+        assert_ne!(history_based, history_disabled);
     }
 
     #[test]
@@ -444,6 +518,13 @@ mod tests {
             prefer_unplayed: false,
             recommendation_variety: 0.25,
             recommendation_size: 80,
+            smart_queue_mode: SmartQueueMode::KeepThreeReady,
+            use_listening_history: false,
+            session_queue: vec![PathBuf::from("queued.mp3")],
+            session_current: Some(PathBuf::from("queued.mp3")),
+            session_position_seconds: 42.0,
+            track_fade_seconds: 3.5,
+            replay_gain_mode: ReplayGainMode::Album,
             ..Preferences::default()
         };
         let encoded = serde_json::to_string(&preferences).expect("settings serialize");
@@ -453,6 +534,134 @@ mod tests {
         assert!(!decoded.prefer_unplayed);
         assert_eq!(decoded.recommendation_variety, 0.25);
         assert_eq!(decoded.recommendation_size, 80);
+        assert_eq!(decoded.smart_queue_mode, SmartQueueMode::KeepThreeReady);
+        assert!(!decoded.use_listening_history);
+        assert_eq!(decoded.session_queue, [PathBuf::from("queued.mp3")]);
+        assert_eq!(decoded.session_current, Some(PathBuf::from("queued.mp3")));
+        assert_eq!(decoded.session_position_seconds, 42.0);
+        assert_eq!(decoded.track_fade_seconds, 3.5);
+        assert_eq!(decoded.replay_gain_mode, ReplayGainMode::Album);
+    }
+
+    #[test]
+    fn restored_queue_snapshot_keeps_saved_position_before_playback_resumes() {
+        let mut app = PlayerApp::new();
+        app.resume_queue_paths = vec![PathBuf::from("one.mp3"), PathBuf::from("two.mp3")];
+        app.resume_current_path = Some(PathBuf::from("two.mp3"));
+        app.resume_position_seconds = 87.5;
+        app.tracks = vec![
+            Track { path: PathBuf::from("one.mp3"), ..Track::default() },
+            Track { path: PathBuf::from("two.mp3"), ..Track::default() },
+        ];
+        app.queue = vec![0, 1];
+        app.current = Some(1);
+
+        let snapshot = app.preferences_snapshot();
+
+        assert_eq!(snapshot.session_queue, app.resume_queue_paths);
+        assert_eq!(snapshot.session_current, Some(PathBuf::from("two.mp3")));
+        assert_eq!(snapshot.session_position_seconds, 87.5);
+    }
+
+    #[test]
+    fn taste_profile_backup_contains_preferences_without_local_paths_or_history() {
+        let profile = TasteProfileBackup {
+            version: 1,
+            favorite_genres: vec!["ambient".into()],
+            liked_artists: vec!["Artist".into()],
+            liked_albums: vec!["Album".into()],
+            discovery: 0.7,
+            prefer_unplayed: true,
+            recommendation_variety: 0.6,
+            recommendation_size: 40,
+            use_listening_history: false,
+        };
+        let json = serde_json::to_string(&profile).expect("profile serializes");
+        let restored: TasteProfileBackup = serde_json::from_str(&json).expect("profile parses");
+        assert_eq!(restored.liked_artists, ["Artist"]);
+        assert!(!json.contains("\"history\""));
+        assert!(!json.contains("\"path\""));
+    }
+
+    #[test]
+    fn track_edge_fades_are_smooth_and_bounded_for_short_tracks() {
+        assert_eq!(playback_fade_gain(0.0, Some(100.0), 4.0), 0.0);
+        assert_eq!(playback_fade_gain(2.0, Some(100.0), 4.0), 0.5);
+        assert_eq!(playback_fade_gain(50.0, Some(100.0), 4.0), 1.0);
+        assert_eq!(playback_fade_gain(98.0, Some(100.0), 4.0), 0.5);
+        assert_eq!(playback_fade_gain(100.0, Some(100.0), 4.0), 0.0);
+        assert_eq!(playback_fade_gain(2.0, Some(4.0), 8.0), 1.0);
+        assert_eq!(playback_fade_gain(2.0, None, 0.0), 1.0);
+    }
+
+    #[test]
+    fn overlapping_crossfade_uses_equal_power_gains() {
+        let (start_out, start_in) = crossfade_gains(0.0);
+        assert!((start_out - 1.0).abs() < f32::EPSILON);
+        assert!(start_in.abs() < f32::EPSILON);
+
+        let (mid_out, mid_in) = crossfade_gains(0.5);
+        assert!((mid_out - 2.0_f32.sqrt() / 2.0).abs() < 0.0001);
+        assert!((mid_in - 2.0_f32.sqrt() / 2.0).abs() < 0.0001);
+        assert!((mid_out.powi(2) + mid_in.powi(2) - 1.0).abs() < 0.0001);
+
+        let (end_out, end_in) = crossfade_gains(1.0);
+        assert!(end_out.abs() < f32::EPSILON);
+        assert!((end_in - 1.0).abs() < f32::EPSILON);
+        assert_eq!(crossfade_gains(2.0), (end_out, end_in));
+    }
+
+    #[test]
+    fn replaygain_conversion_is_bounded_and_uses_neutral_gain_when_missing() {
+        assert_eq!(replay_gain_multiplier_from_db(None), 1.0);
+        assert!((replay_gain_multiplier_from_db(Some(-6.0)) - 0.5011872).abs() < 0.0001);
+        assert_eq!(replay_gain_multiplier_from_db(Some(80.0)), replay_gain_multiplier_from_db(Some(6.0)));
+        assert_eq!(replay_gain_multiplier_from_db(Some(f32::NAN)), 1.0);
+        assert_eq!(parse_replay_gain_db("-7.35 dB"), Some(-7.35));
+        assert_eq!(parse_replay_gain_db("not a gain"), None);
+    }
+
+    #[test]
+    fn rule_playlists_recompute_from_current_followed_artists() {
+        let mut app = PlayerApp::new();
+        app.tracks = vec![
+            Track { path: PathBuf::from("one.mp3"), artist: "One".into(), ..Track::default() },
+            Track { path: PathBuf::from("two.mp3"), artist: "Two".into(), ..Track::default() },
+        ];
+        app.playlists = vec![Playlist {
+            name: "Followed artists Mix".into(),
+            tracks: Vec::new(),
+            rule: Some(SmartPlaylistRule::FollowedArtists),
+        }];
+        app.liked_artists.insert("one".into());
+        assert_eq!(app.playlist_track_indices(0), [0]);
+        app.liked_artists.insert("two".into());
+        assert_eq!(app.playlist_track_indices(0), [0, 1]);
+    }
+
+    #[test]
+    fn ai_mix_candidate_preview_and_request_scope_share_the_same_privacy_filters() {
+        let mut app = PlayerApp::new();
+        app.tracks = vec![
+            Track { path: PathBuf::from("liked.mp3"), title: "Liked title".into(), artist: "Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("played.mp3"), title: "Played title".into(), artist: "Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("new.mp3"), title: "New title".into(), artist: "Artist".into(), ..Track::default() },
+            Track { path: PathBuf::from("excluded.mp3"), title: "Excluded".into(), ..Track::default() },
+        ];
+        app.liked_songs.insert(PathBuf::from("liked.mp3"));
+        app.history.push(PathBuf::from("played.mp3"));
+        app.disliked_songs.insert(PathBuf::from("new.mp3"));
+        app.excluded_tracks.insert(PathBuf::from("excluded.mp3"));
+        app.ai_mix_include_liked = true;
+        app.ai_mix_include_played = false;
+        app.ai_mix_include_unplayed = false;
+
+        let candidates = app.ai_mix_candidates();
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].title, "Liked title");
+        assert_eq!(candidates[0].familiarity, "L");
+        assert_eq!(candidates[0].artist, "Artist");
     }
 
     #[test]

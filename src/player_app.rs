@@ -9,6 +9,11 @@ impl PlayerApp {
             Ok(preferences) => (preferences, None),
             Err(error) => (Preferences::default(), Some(error)),
         };
+        let launched_with_media = startup_folder.is_some() || startup_file.is_some();
+        let auto_completed_welcome = !preferences.welcome_completed && launched_with_media;
+        let welcome_completed = preferences.welcome_completed || launched_with_media;
+        let welcome_open = !welcome_completed;
+        let welcome_step = if preferences.folders.is_empty() { 0 } else { 2 };
         let startup_folder = startup_folder.or_else(|| {
             startup_file
                 .as_ref()
@@ -33,15 +38,20 @@ impl PlayerApp {
             let _ = update_check_sender.send(UpdateMessage::Check(result));
         });
         let mut app = Self {
+            welcome_open,
+            welcome_step,
+            welcome_completed,
             tracks: Vec::new(),
             folders: preferences.folders,
             liked_songs: preferences.liked_songs,
             disliked_songs: preferences.disliked_songs,
             liked_artists: preferences.liked_artists,
             liked_albums: preferences.liked_albums,
+            favorite_genres: preferences.favorite_genres,
             playlists: preferences.playlists,
             history: preferences.history,
             track_engagement: preferences.track_engagement,
+            recommendation_feedback: preferences.recommendation_feedback,
             excluded_tracks: preferences.excluded_tracks,
             query: String::new(),
             search_history: preferences.search_history.into_iter().take(5).collect(),
@@ -119,8 +129,13 @@ impl PlayerApp {
             home_cache_dirty: true,
             shuffle: preferences.shuffle,
             repeat: preferences.repeat,
+            smart_queue_mode: preferences.smart_queue_mode,
+            use_listening_history: preferences.use_listening_history,
+            track_fade_seconds: preferences.track_fade_seconds.clamp(0.0, 8.0),
+            replay_gain_mode: preferences.replay_gain_mode,
             playlist_name: String::new(),
             renaming_playlist: None,
+            smart_playlist_rule: SmartPlaylistRule::default(),
             playlist_rename_draft: String::new(),
             selected_playlist: None,
             selected_artist: None,
@@ -136,9 +151,13 @@ impl PlayerApp {
             lyrics: None,
             lyrics_error: None,
             queue: Vec::new(),
+            resume_queue_paths: preferences.session_queue,
+            resume_current_path: preferences.session_current,
+            resume_position_seconds: preferences.session_position_seconds.max(0.0),
             queue_collapsed: !preferences.show_queue_on_start,
             now_playing_expanded: false,
             now_playing_tab: NowPlayingTab::UpNext,
+            session_target_minutes: 45,
             compact_mode: preferences.compact_mode,
             start_maximized: preferences.start_maximized,
             animations_enabled: preferences.animations_enabled,
@@ -150,8 +169,12 @@ impl PlayerApp {
             last_engagement_save: Instant::now(),
             sink: None,
             stream: None,
+            crossfade: None,
+            crossfade_unavailable_path: None,
             scan_receiver: None,
             scan_status: String::new(),
+            scan_issues: Vec::new(),
+            scan_issue_count: 0,
             scan_busy: false,
             initial_library_loading: false,
             scan_rate_per_second: preferences.scan_rate_per_second.min(100_000),
@@ -223,6 +246,8 @@ impl PlayerApp {
         }
         if add_startup_folder.is_some() {
             app.status = "Added the File Explorer folder to your Lilt library.".into();
+            app.save_state();
+        } else if auto_completed_welcome {
             app.save_state();
         }
         app
@@ -443,6 +468,7 @@ impl PlayerApp {
                 MediaKeyCommand::Play => {
                     if let Some(sink) = &self.sink {
                         sink.play();
+                        if let Some(transition) = &self.crossfade { transition.next_sink.play(); }
                     } else if !self.queue.is_empty() {
                         self.play_queue_at(self.current.unwrap_or(0));
                     }
@@ -450,21 +476,27 @@ impl PlayerApp {
                 MediaKeyCommand::Pause => {
                     if let Some(sink) = &self.sink {
                         sink.pause();
+                        if let Some(transition) = &self.crossfade { transition.next_sink.pause(); }
                     }
                 }
                 MediaKeyCommand::Next => self.next_track(),
                 MediaKeyCommand::Previous => self.previous_track(),
                 MediaKeyCommand::Stop => {
+                    self.cancel_crossfade();
                     self.sink = None;
                     self.stream = None;
                     self.current = None;
                     self.playback_offset = Duration::ZERO;
+                    self.resume_current_path = None;
+                    self.resume_position_seconds = 0.0;
+                    self.save_state();
                 }
             }
         }
     }
 
     fn queue_track_next(&mut self, index: usize) {
+        self.cancel_crossfade();
         if self
             .current
             .is_some_and(|position| self.queue.get(position) == Some(&index))
@@ -480,6 +512,7 @@ impl PlayerApp {
         }
         let insertion = self.current.map_or(0, |current| current + 1);
         self.queue.insert(insertion.min(self.queue.len()), index);
+        self.save_state();
         self.status = format!(
             "Added {} to play next.",
             self.tracks
@@ -489,6 +522,7 @@ impl PlayerApp {
     }
 
     fn add_tracks_to_queue(&mut self, tracks: &[usize]) {
+        self.cancel_crossfade();
         let mut added = 0;
         for &index in tracks {
             if self.tracks.get(index).is_some()
@@ -507,6 +541,31 @@ impl PlayerApp {
                 if added == 1 { "song" } else { "songs" }
             )
         };
+        if added > 0 {
+            self.save_state();
+        }
+    }
+
+    fn start_listening_session(&mut self, target_minutes: usize) {
+        let target_seconds = target_minutes.max(5) as f64 * 60.0;
+        let candidates = self.recommendation_indices();
+        let mut session = Vec::new();
+        let mut seconds = 0.0;
+        for index in candidates {
+            let Some(track) = self.tracks.get(index) else { continue; };
+            if self.excluded_tracks.contains(&track.path) || self.disliked_songs.contains(&track.path) {
+                continue;
+            }
+            session.push(index);
+            seconds += track.duration.max(30.0);
+            if seconds >= target_seconds { break; }
+        }
+        if session.is_empty() {
+            self.status = "Play more music to build a listening session.".into();
+            return;
+        }
+        self.play_indices(session, 0);
+        self.status = format!("Started a {target_minutes}-minute listening session · {} tracks.", self.queue.len());
     }
 
     fn queue_tracks_next(&mut self, tracks: &[usize]) {
@@ -520,6 +579,33 @@ impl PlayerApp {
         };
     }
 
+    fn select_playlist_for_playback(&mut self, index: usize) -> Vec<usize> {
+        let Some(playlist) = self.playlists.get(index) else {
+            self.status = "That playlist no longer exists.".into();
+            return Vec::new();
+        };
+        let playlist_name = playlist.name.clone();
+        let tracks = self.playlist_track_indices(index);
+        self.page = Page::Playlists;
+        self.selected_playlist = Some(index);
+        if tracks.is_empty() {
+            self.status = format!("{playlist_name} has no available tracks to play.");
+        }
+        tracks
+    }
+
+    fn play_playlist(&mut self, index: usize, shuffle: bool) {
+        let tracks = self.select_playlist_for_playback(index);
+        if tracks.is_empty() {
+            return;
+        }
+        if shuffle {
+            self.play_shuffled_indices(tracks);
+        } else {
+            self.play_indices(tracks, 0);
+        }
+    }
+
     fn create_playlist_from_tracks(&mut self, name: &str, tracks: &[usize]) {
         let paths = tracks
             .iter()
@@ -529,7 +615,10 @@ impl PlayerApp {
             self.status = "There are no available songs for that playlist.".into();
             return;
         }
-        let base_name = if name.starts_with("My Mix ") || name.starts_with("Daily Mix") {
+        let base_name = if name.starts_with("My Mix ")
+            || name.starts_with("Daily Mix")
+            || name == "Listening session"
+        {
             name.trim().to_string()
         } else {
             format!("{name} Mix")
@@ -547,9 +636,24 @@ impl PlayerApp {
         self.playlists.push(Playlist {
             name: playlist_name.clone(),
             tracks: paths,
+            rule: None,
         });
         self.save_state();
         self.status = format!("Created playlist “{playlist_name}”.");
+    }
+
+    fn create_smart_playlist(&mut self, rule: SmartPlaylistRule) {
+        let base = format!("{} Mix", rule.label());
+        let mut name = base.clone();
+        let mut suffix = 2;
+        while self.playlists.iter().any(|playlist| playlist.name.eq_ignore_ascii_case(&name)) {
+            name = format!("{base} {suffix}");
+            suffix += 1;
+        }
+        self.playlists.push(Playlist { name: name.clone(), tracks: Vec::new(), rule: Some(rule) });
+        self.selected_playlist = Some(self.playlists.len() - 1);
+        self.save_state();
+        self.status = format!("Created smart playlist “{name}”.");
     }
 
     fn play_shuffled_indices(&mut self, mut tracks: Vec<usize>) {
@@ -1567,15 +1671,23 @@ impl PlayerApp {
                     .iter()
                     .filter_map(|&index| self.tracks.get(index).map(|track| track.path.clone()))
                     .collect::<Vec<_>>();
+                let queued_paths = if queued_paths.is_empty() {
+                    std::mem::take(&mut self.resume_queue_paths)
+                } else {
+                    queued_paths
+                };
                 let current_path = self
                     .current
                     .and_then(|position| self.queue.get(position))
                     .and_then(|&index| self.tracks.get(index))
                     .map(|track| track.path.clone());
+                let current_path = current_path.or_else(|| self.resume_current_path.clone());
                 self.scan_busy = false;
                 self.initial_library_loading = false;
                 self.scan_receiver = None;
                 self.scan_progress = None;
+                self.scan_issues = result.issues;
+                self.scan_issue_count = result.issue_count;
                 let auto_deleted_count = result.auto_deleted_count;
                 let auto_delete_failures = result.auto_delete_failures;
                 let auto_deleted_set = result
@@ -1598,6 +1710,7 @@ impl PlayerApp {
                             .retain(|path| !auto_deleted_set.contains(path));
                     }
                 }
+                self.cancel_crossfade();
                 self.tracks = result.tracks;
                 self.tracks
                     .retain(|track| !self.excluded_tracks.contains(&track.path));
@@ -1630,6 +1743,7 @@ impl PlayerApp {
                         .position(|&index| self.tracks[index].path == path)
                 });
                 if self.current.is_none() {
+                    self.cancel_crossfade();
                     self.sink = None;
                     self.stream = None;
                 }
@@ -2184,6 +2298,7 @@ impl PlayerApp {
         let deleting_current = current_path.as_deref() == Some(path);
         let previous_position = self.current;
         if deleting_current {
+            self.cancel_crossfade();
             self.sink = None;
             self.stream = None;
             self.current = None;
@@ -2298,6 +2413,7 @@ impl PlayerApp {
             .as_ref()
             .is_some_and(|path| deleted_set.contains(path))
         {
+            self.cancel_crossfade();
             self.sink = None;
             self.stream = None;
             self.current = None;
@@ -2395,6 +2511,7 @@ impl PlayerApp {
             .as_ref()
             .is_some_and(|path| deleted_set.contains(path))
         {
+            self.cancel_crossfade();
             self.sink = None;
             self.stream = None;
             self.current = None;
@@ -2460,8 +2577,26 @@ impl PlayerApp {
     }
 
     fn preferences_snapshot(&self) -> Preferences {
+        let session_queue = if self.queue.is_empty() {
+            self.resume_queue_paths.clone()
+        } else {
+            self.queue.iter().filter_map(|&index| self.tracks.get(index).map(|track| track.path.clone())).collect()
+        };
+        let session_current = self.current
+            .and_then(|position| self.queue.get(position))
+            .and_then(|&index| self.tracks.get(index))
+            .map(|track| track.path.clone())
+            .or_else(|| self.resume_current_path.clone());
+        let session_position_seconds = if self.sink.is_some() {
+            self.current_playback_path_and_position()
+                .map_or(self.resume_position_seconds, |(_, position)| position.as_secs_f64())
+        } else {
+            self.resume_position_seconds
+        };
         Preferences {
+            welcome_completed: self.welcome_completed,
             folders: self.folders.clone(),
+            favorite_genres: self.favorite_genres.clone(),
             liked_songs: self.liked_songs.clone(),
             disliked_songs: self.disliked_songs.clone(),
             liked_artists: self.liked_artists.clone(),
@@ -2469,6 +2604,7 @@ impl PlayerApp {
             playlists: self.playlists.clone(),
             history: self.history.clone(),
             track_engagement: self.track_engagement.clone(),
+            recommendation_feedback: self.recommendation_feedback.clone(),
             search_history: self.search_history.clone(),
             excluded_tracks: self.excluded_tracks.clone(),
             view_mode: self.view_mode,
@@ -2477,6 +2613,10 @@ impl PlayerApp {
             accent: self.accent.clone(),
             shuffle: self.shuffle,
             repeat: self.repeat,
+            smart_queue_mode: self.smart_queue_mode,
+            use_listening_history: self.use_listening_history,
+            track_fade_seconds: self.track_fade_seconds,
+            replay_gain_mode: self.replay_gain_mode,
             discovery: self.discovery,
             prefer_unplayed: self.prefer_unplayed,
             recommendation_variety: self.recommendation_variety,
@@ -2501,6 +2641,9 @@ impl PlayerApp {
             auto_purge_deleted: self.auto_purge_deleted,
             scan_rate_per_second: self.scan_rate_per_second,
             daily_mixes: self.daily_mix_paths.to_vec(),
+            session_queue,
+            session_current,
+            session_position_seconds,
             show_queue_on_start: !self.queue_collapsed,
             compact_mode: self.compact_mode,
             start_maximized: self.start_maximized,
@@ -2534,6 +2677,52 @@ impl PlayerApp {
         // Like and dislike both affect the liked set (disliking removes a like),
         // so refresh duplicate suggestions on the cancellable worker thread.
         self.start_duplicate_scan();
+    }
+
+    fn set_recommendation_feedback(&mut self, index: usize, rating: i8) {
+        let Some(path) = self.tracks.get(index).map(|track| track.path.clone()) else {
+            return;
+        };
+        if self.recommendation_feedback.get(&path) == Some(&rating) {
+            self.recommendation_feedback.remove(&path);
+        } else {
+            self.recommendation_feedback.insert(path, rating);
+        }
+        self.recommendations_dirty = true;
+        self.home_cache_dirty = true;
+        self.save_state();
+        self.status = if rating > 0 {
+            "Recommendation feedback saved · more like this.".into()
+        } else {
+            "Recommendation feedback saved · less like this.".into()
+        };
+    }
+
+    fn recommendation_reason(&self, index: usize, listened_artists: &HashSet<String>) -> &'static str {
+        let Some(track) = self.tracks.get(index) else { return "Picked for you"; };
+        if self.recommendation_feedback.get(&track.path) == Some(&1) {
+            return "You asked for more like this";
+        }
+        if self.recommendation_feedback.get(&track.path) == Some(&-1) {
+            return "You asked for less like this";
+        }
+        let artist = track.artist.to_lowercase();
+        if artist_names(&track.artist).iter().any(|name| self.liked_artists.contains(&name.to_lowercase())) {
+            return "From an artist you follow";
+        }
+        if self.liked_albums.contains(&track.album.to_lowercase()) {
+            return "From an album you saved";
+        }
+        if !is_unknown(&track.genre) && self.favorite_genres.contains(&track.genre.to_lowercase()) {
+            return "Matches a favorite genre";
+        }
+        if artist_names(&track.artist).iter().any(|name| listened_artists.contains(&name.to_lowercase())) || listened_artists.contains(&artist) {
+            return "Related to artists in your listening history";
+        }
+        if self.track_engagement.get(&track.path).is_some_and(|engagement| engagement.completions > 0 || engagement.replays > 0) {
+            return "A track you have enjoyed before";
+        }
+        "A fresh pick from your library"
     }
 
     fn toggle_artist_like(&mut self, artist: &str) {
@@ -2787,6 +2976,59 @@ impl PlayerApp {
             .collect()
     }
 
+    fn playlist_track_indices(&self, playlist_index: usize) -> Vec<usize> {
+        let Some(playlist) = self.playlists.get(playlist_index) else { return Vec::new(); };
+        let Some(rule) = playlist.rule else { return self.indices_for_paths(&playlist.tracks); };
+        let mut indices = match rule {
+            SmartPlaylistRule::LikedSongs => self.tracks.iter().enumerate()
+                .filter(|(_, track)| self.liked_songs.contains(&track.path))
+                .map(|(index, _)| index).collect::<Vec<_>>(),
+            SmartPlaylistRule::FollowedArtists => self.tracks.iter().enumerate()
+                .filter(|(_, track)| artist_names(&track.artist).iter().any(|artist| self.liked_artists.contains(&artist.to_lowercase())))
+                .map(|(index, _)| index).collect::<Vec<_>>(),
+            SmartPlaylistRule::RecentlyAdded => self.tracks.iter().enumerate()
+                .filter(|(_, track)| !self.excluded_tracks.contains(&track.path))
+                .map(|(index, _)| index).collect::<Vec<_>>(),
+            SmartPlaylistRule::Rediscover => {
+                let recently_played = self.history.iter().take(30).collect::<HashSet<_>>();
+                let mut ranked = self.tracks.iter().enumerate()
+                    .filter(|(_, track)| !self.excluded_tracks.contains(&track.path) && !self.disliked_songs.contains(&track.path) && !recently_played.contains(&track.path))
+                    .filter_map(|(index, track)| {
+                        let engagement = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                        let plays = engagement.plays.max(1) as f32;
+                        let completion = (engagement.completions as f32 / plays).clamp(0.0, 1.0);
+                        let score = completion * 3.0 + (engagement.replays as f32 / plays).clamp(0.0, 1.0) * 1.5 + if self.liked_songs.contains(&track.path) { 2.0 } else { 0.0 };
+                        (engagement.plays > 0 && (completion > 0.45 || engagement.replays > 0 || self.liked_songs.contains(&track.path))).then_some((index, score))
+                    }).collect::<Vec<_>>();
+                ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+                ranked.into_iter().map(|(index, _)| index).collect()
+            }
+            SmartPlaylistRule::FavoriteGenres => self.tracks.iter().enumerate()
+                .filter(|(_, track)| self.favorite_genres.contains(&track.genre.trim().to_lowercase()))
+                .map(|(index, _)| index).collect::<Vec<_>>(),
+        };
+        indices.retain(|&index| self.tracks.get(index).is_some_and(|track| !self.excluded_tracks.contains(&track.path)));
+        match rule {
+            SmartPlaylistRule::RecentlyAdded => indices.sort_by_key(|&index| std::cmp::Reverse(self.tracks[index].added)),
+            SmartPlaylistRule::Rediscover => {
+                indices.sort_by(|&left, &right| {
+                    let score = |index: usize| {
+                        let track = &self.tracks[index];
+                        let engagement = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                        let plays = engagement.plays.max(1) as f32;
+                        (engagement.completions as f32 / plays).clamp(0.0, 1.0) * 3.0
+                            + (engagement.replays as f32 / plays).clamp(0.0, 1.0) * 1.5
+                            + if self.liked_songs.contains(&track.path) { 2.0 } else { 0.0 }
+                    };
+                    score(right).total_cmp(&score(left)).then_with(|| left.cmp(&right))
+                });
+            }
+            _ => indices.sort_unstable(),
+        }
+        if rule == SmartPlaylistRule::RecentlyAdded { indices.truncate(100); }
+        indices
+    }
+
     fn page_track_indices(&self) -> Vec<usize> {
         let mut indices = match self.page {
             Page::LikedSongs => self
@@ -2807,8 +3049,7 @@ impl PlayerApp {
             Page::Discover | Page::Mixes | Page::Stats => Vec::new(),
             Page::Playlists => self
                 .selected_playlist
-                .and_then(|playlist| self.playlists.get(playlist))
-                .map(|playlist| self.indices_for_paths(&playlist.tracks))
+                .map(|playlist| self.playlist_track_indices(playlist))
                 .unwrap_or_default(),
             Page::LikedAlbums => {
                 let albums = self.albums(&(0..self.tracks.len()).collect::<Vec<_>>());
@@ -2889,6 +3130,9 @@ impl PlayerApp {
     }
 
     fn play_queue_at(&mut self, queue_position: usize) {
+        self.cancel_crossfade();
+        self.crossfade_unavailable_path = None;
+
         let Some(&track_index) = self.queue.get(queue_position) else {
             return;
         };
@@ -2903,6 +3147,11 @@ impl PlayerApp {
             .and_then(|position| self.queue.get(position))
             .and_then(|&index| self.tracks.get(index))
             .is_some_and(|previous| previous.path == track_path);
+        let resume_offset = if self.resume_current_path.as_ref() == Some(&track_path) {
+            Duration::from_secs_f64(self.resume_position_seconds.min(track.duration.max(0.0)))
+        } else {
+            Duration::ZERO
+        };
         if self.lyrics_enabled {
             self.load_lyrics_for(&track_path);
         } else {
@@ -2930,30 +3179,192 @@ impl PlayerApp {
                 return;
             }
         };
-        sink.set_volume(self.volume);
-        sink.append(source);
+        sink.set_volume(self.volume * self.replay_gain_multiplier(track_index));
+        sink.append(source.skip_duration(resume_offset));
         self.sink = Some(sink);
         self.stream = Some(stream);
         self.current = Some(queue_position);
-        self.playback_offset = Duration::ZERO;
-        self.last_playback_sample = Some((track_path.clone(), Duration::ZERO));
+        self.playback_offset = resume_offset;
+        self.last_playback_sample = Some((track_path.clone(), resume_offset));
+        self.update_track_fade();
+        self.resume_current_path = None;
+        self.resume_position_seconds = 0.0;
         self.completed_session_path = None;
-        let engagement = self.track_engagement.entry(track_path.clone()).or_default();
+        self.record_track_started(track_path, replay);
+        self.save_state();
+        self.status = format!("Playing {} — {}", track_title, track_artist);
+        if self.smart_queue_mode == SmartQueueMode::KeepThreeReady {
+            self.extend_smart_queue(3);
+        }
+    }
+
+    fn cancel_crossfade(&mut self) {
+        if let Some(transition) = self.crossfade.take() {
+            transition.next_sink.stop();
+        }
+        self.crossfade_unavailable_path = None;
+        self.update_track_fade();
+    }
+
+    fn record_track_started(&mut self, path: PathBuf, replay: bool) {
+        let engagement = self.track_engagement.entry(path.clone()).or_default();
         engagement.plays = engagement.plays.saturating_add(1);
         if replay {
             engagement.replays = engagement.replays.saturating_add(1);
         }
-        self.history.retain(|path| path != &track_path);
-        self.home_cache_dirty = true;
-        self.history.insert(0, track_path);
+        self.history.retain(|existing| existing != &path);
+        self.history.insert(0, path);
         self.history.truncate(500);
         self.recommendations_dirty = true;
         self.home_cache_dirty = true;
+    }
+
+    fn update_playback_transition(&mut self) {
+        if self.crossfade.is_none() {
+            self.maybe_start_crossfade();
+        }
+        self.update_track_fade();
+        let finished = self.crossfade.as_ref().is_some_and(|transition| {
+            transition.next_sink.get_pos() >= transition.duration
+        });
+        if finished {
+            self.finish_crossfade();
+        }
+    }
+
+    fn maybe_start_crossfade(&mut self) {
+        let configured = self.track_fade_seconds.clamp(0.0, 8.0);
+        if configured <= 0.0 || self.repeat == RepeatMode::One {
+            return;
+        }
+        let Some(sink) = &self.sink else { return; };
+        if sink.is_paused() || sink.empty() { return; }
+        let Some(current_position) = self.current else { return; };
+        let Some(&current_index) = self.queue.get(current_position) else { return; };
+        let Some(current_track) = self.tracks.get(current_index) else { return; };
+        let current_path = current_track.path.clone();
+        if self.crossfade_unavailable_path.as_ref() == Some(&current_path) { return; }
+        let current_duration = current_track.duration;
+        if !current_duration.is_finite() || current_duration <= 0.0 { return; }
+        let position = self.playback_offset + sink.get_pos();
+        let remaining = current_duration - position.as_secs_f64();
+        if remaining <= 0.0 { return; }
+
+        let mut next_position = current_position + 1;
+        if next_position >= self.queue.len() {
+            if self.repeat == RepeatMode::All && !self.queue.is_empty() {
+                next_position = 0;
+            } else if self.smart_queue_mode == SmartQueueMode::WhenQueueEnds {
+                self.extend_smart_queue(12);
+                next_position = current_position + 1;
+                if next_position >= self.queue.len() { return; }
+            } else {
+                return;
+            }
+        }
+        let Some(&next_track_index) = self.queue.get(next_position) else { return; };
+        let Some(next_track) = self.tracks.get(next_track_index) else { return; };
+        if next_track.path == current_path { return; }
+        let mut crossfade_seconds = configured.min((current_duration * 0.5) as f32) as f64;
+        if next_track.duration.is_finite() && next_track.duration > 0.0 {
+            crossfade_seconds = crossfade_seconds.min(next_track.duration * 0.5);
+        }
+        if crossfade_seconds <= 0.0 || remaining > crossfade_seconds { return; }
+        let duration = Duration::from_secs_f64(remaining.min(crossfade_seconds));
+        if duration < Duration::from_millis(100) { return; }
+
+        let next_path = next_track.path.clone();
+        let (next_stream, handle) = match OutputStream::try_default() {
+            Ok(output) => output,
+            Err(error) => {
+                self.crossfade_unavailable_path = Some(current_path);
+                self.status = format!("Crossfade could not open a second audio stream: {error}");
+                return;
+            }
+        };
+        let next_sink = match Sink::try_new(&handle) {
+            Ok(sink) => sink,
+            Err(error) => {
+                self.crossfade_unavailable_path = Some(current_path);
+                self.status = format!("Crossfade could not prepare the next track: {error}");
+                return;
+            }
+        };
+        let source = match open_audio_source(&next_path) {
+            Ok(source) => source,
+            Err(error) => {
+                self.crossfade_unavailable_path = Some(current_path);
+                self.status = format!("Crossfade could not decode {}: {error}", next_path.display());
+                return;
+            }
+        };
+        next_sink.set_volume(0.0);
+        next_sink.append(source);
+        self.crossfade = Some(CrossfadeTransition {
+            next_sink,
+            next_stream,
+            next_queue_position: next_position,
+            next_track_index,
+            duration,
+        });
+    }
+
+    fn finish_crossfade(&mut self) {
+        let Some(transition) = self.crossfade.take() else { return; };
+        let Some(track) = self.tracks.get(transition.next_track_index) else { return; };
+        let track_path = track.path.clone();
+        let track_title = track.title.clone();
+        let track_artist = display_credit(&track.artist);
+        if let Some(old_sink) = self.sink.take() { old_sink.stop(); }
+        self.stream = None;
+        self.sink = Some(transition.next_sink);
+        self.stream = Some(transition.next_stream);
+        self.current = Some(transition.next_queue_position);
+        self.playback_offset = Duration::ZERO;
+        self.last_playback_sample = Some((track_path.clone(), Duration::ZERO));
+        self.completed_session_path = None;
+        self.resume_current_path = None;
+        self.resume_position_seconds = 0.0;
+        if self.lyrics_enabled {
+            self.load_lyrics_for(&track_path);
+        }
+        self.record_track_started(track_path, false);
+        self.crossfade_unavailable_path = None;
         self.save_state();
         self.status = format!("Playing {} — {}", track_title, track_artist);
+        if self.smart_queue_mode == SmartQueueMode::KeepThreeReady {
+            self.extend_smart_queue(3);
+        }
+    }
+
+    fn extend_smart_queue(&mut self, target_upcoming: usize) {
+        let Some(current) = self.current else { return; };
+        let upcoming = self.queue.len().saturating_sub(current + 1);
+        if upcoming >= target_upcoming { return; }
+        let needed = target_upcoming - upcoming;
+        let recommendations = self.recommendation_indices();
+        let mut added = 0;
+        for index in recommendations {
+            if self.queue.contains(&index)
+                || self.tracks.get(index).is_none_or(|track| {
+                    self.disliked_songs.contains(&track.path)
+                        || self.excluded_tracks.contains(&track.path)
+                })
+            {
+                continue;
+            }
+            self.queue.push(index);
+            added += 1;
+            if added >= needed { break; }
+        }
+        if added > 0 {
+            self.status = format!("{} · Smart Queue added {added} picks", self.status);
+            self.save_state();
+        }
     }
 
     fn seek_current_to(&mut self, position: Duration) {
+        self.cancel_crossfade();
         let Some(queue_position) = self.current else {
             return;
         };
@@ -3016,7 +3427,7 @@ impl PlayerApp {
                 return;
             }
         };
-        sink.set_volume(self.volume);
+        sink.set_volume(self.volume * self.replay_gain_multiplier(track_index));
         if decoder_seeks {
             sink.append(decoder.expect("decoder exists when native seek succeeded"));
         } else if is_opus {
@@ -3065,6 +3476,7 @@ impl PlayerApp {
     }
 
     fn play_indices_with_shuffle(&mut self, tracks: Vec<usize>, start: usize, shuffle_all: bool) {
+        self.cancel_crossfade();
         if tracks.is_empty() {
             self.status = "There are no playable songs in this selection.".into();
             return;
@@ -3087,10 +3499,10 @@ impl PlayerApp {
 
     fn toggle_playback(&mut self) {
         if let Some(sink) = &self.sink {
-            if sink.is_paused() {
-                sink.play();
-            } else {
-                sink.pause();
+            let was_paused = sink.is_paused();
+            if was_paused { sink.play(); } else { sink.pause(); }
+            if let Some(transition) = &self.crossfade {
+                if was_paused { transition.next_sink.play(); } else { transition.next_sink.pause(); }
             }
         } else if !self.queue.is_empty() {
             self.play_queue_at(self.current.unwrap_or(0));
@@ -3135,6 +3547,11 @@ impl PlayerApp {
             self.play_queue_at(next);
         } else if self.repeat == RepeatMode::All && !self.queue.is_empty() {
             self.play_queue_at(0);
+        } else if self.smart_queue_mode == SmartQueueMode::WhenQueueEnds {
+            self.extend_smart_queue(12);
+            if next < self.queue.len() {
+                self.play_queue_at(next);
+            }
         }
     }
 
@@ -3195,6 +3612,49 @@ impl PlayerApp {
         }
     }
 
+    fn update_track_fade(&self) {
+        let Some(sink) = &self.sink else { return; };
+        if sink.is_paused() {
+            return;
+        }
+        if let Some(transition) = &self.crossfade {
+            let progress = if transition.duration.is_zero() { 1.0 } else {
+                (transition.next_sink.get_pos().as_secs_f64() / transition.duration.as_secs_f64()).clamp(0.0, 1.0) as f32
+            };
+            let current_gain = self.current.and_then(|position| self.queue.get(position)).copied()
+                .map_or(1.0, |index| self.replay_gain_multiplier(index));
+            let next_gain = self.replay_gain_multiplier(transition.next_track_index);
+            let (outgoing, incoming) = crossfade_gains(progress);
+            sink.set_volume(self.volume * current_gain * outgoing);
+            transition.next_sink.set_volume(self.volume * next_gain * incoming);
+            return;
+        }
+        let position = self.playback_offset + sink.get_pos();
+        let duration = self.current
+            .and_then(|position| self.queue.get(position))
+            .and_then(|&index| self.tracks.get(index))
+            .map(|track| track.duration.max(0.0));
+        let gain = playback_fade_gain(position.as_secs_f64(), duration, self.track_fade_seconds);
+        let track_gain = self.current.and_then(|position| self.queue.get(position)).copied()
+            .map_or(1.0, |index| self.replay_gain_multiplier(index));
+        sink.set_volume(self.volume * track_gain * gain);
+    }
+
+    fn replay_gain_multiplier(&self, track_index: usize) -> f32 {
+        let Some(track) = self.tracks.get(track_index) else { return 1.0; };
+        let decibels = match self.replay_gain_mode {
+            ReplayGainMode::Off => None,
+            ReplayGainMode::Track => track.replay_gain_track_db,
+            ReplayGainMode::Album => track.replay_gain_album_db.or(track.replay_gain_track_db),
+        };
+        replay_gain_multiplier_from_db(decibels)
+    }
+
+    fn current_output_volume(&self) -> f32 {
+        self.current.and_then(|position| self.queue.get(position)).copied()
+            .map_or(self.volume, |index| self.volume * self.replay_gain_multiplier(index))
+    }
+
     fn previous_track(&mut self) {
         if let Some(current) = self.current {
             if current > 0 {
@@ -3206,6 +3666,7 @@ impl PlayerApp {
     }
 
     fn swap_queue_positions(&mut self, first: usize, second: usize) {
+        self.cancel_crossfade();
         self.queue.swap(first, second);
         self.current = self.current.map(|current| {
             if current == first {
@@ -3216,6 +3677,7 @@ impl PlayerApp {
                 current
             }
         });
+        self.save_state();
     }
 
     fn track_row(&mut self, ui: &mut egui::Ui, index: usize) {
@@ -3477,7 +3939,9 @@ impl PlayerApp {
             .on_hover_text("Right-click for more song actions");
         self.show_track_context_menu(&row_response, index);
         if queue && !self.queue.contains(&index) {
+            self.cancel_crossfade();
             self.queue.push(index);
+            self.save_state();
             self.status = format!("Added {title} to the queue.");
         }
         if like {
@@ -3544,6 +4008,8 @@ impl PlayerApp {
     }
 
     fn show_now_playing_view(&mut self, ui: &mut egui::Ui) {
+        let mut recommendation_feedback_action = None;
+        let mut build_session = false;
         let current_position = self.current;
         let current_index = current_position
             .and_then(|position| self.queue.get(position))
@@ -3551,12 +4017,15 @@ impl PlayerApp {
         let current_track = current_index
             .and_then(|index| self.tracks.get(index))
             .cloned();
+        let track_artist_by_path = self.tracks.iter().map(|track| (track.path.as_path(), track.artist.as_str())).collect::<HashMap<_, _>>();
+        let listened_artists = self.history.iter().filter_map(|path| track_artist_by_path.get(path.as_path()).map(|artist| artist.to_lowercase())).collect::<HashSet<_>>();
         let cover = current_index.and_then(|index| self.artwork_texture(ui.ctx(), index));
         let accent = accent_color(&self.accent);
 
         let mut suggestions = self.recommendations.clone();
         suggestions.retain(|&index| {
             Some(index) != current_index
+                && !self.queue.contains(&index)
                 && self.tracks.get(index).is_some_and(|track| {
                     !self.disliked_songs.contains(&track.path)
                         && !self.excluded_tracks.contains(&track.path)
@@ -3566,6 +4035,7 @@ impl PlayerApp {
             for (index, track) in self.tracks.iter().enumerate() {
                 if Some(index) != current_index
                     && !suggestions.contains(&index)
+                    && !self.queue.contains(&index)
                     && !self.disliked_songs.contains(&track.path)
                     && !self.excluded_tracks.contains(&track.path)
                 {
@@ -3601,6 +4071,9 @@ impl PlayerApp {
         let mut queue_again_all = Vec::new();
         let mut play_radio = false;
         let mut add_radio = false;
+        let mut clear_upcoming = false;
+        let mut shuffle_upcoming = false;
+        let mut save_queue_playlist = false;
         let mut like_current = false;
         let mut dislike_current = false;
 
@@ -3618,15 +4091,6 @@ impl PlayerApp {
                     .clicked()
                 {
                     self.now_playing_tab = NowPlayingTab::ForYou;
-                }
-                if ui
-                    .selectable_label(
-                        self.now_playing_tab == NowPlayingTab::Visualizer,
-                        "Visualizer",
-                    )
-                    .clicked()
-                {
-                    self.now_playing_tab = NowPlayingTab::Visualizer;
                 }
                 if self.lyrics_enabled
                     && ui
@@ -3675,6 +4139,25 @@ impl PlayerApp {
                     );
                     if !track.album.is_empty() {
                         ui.label(RichText::new(&track.album).small().color(Color32::GRAY));
+                    }
+                    if let Some(position) = current_position {
+                        egui::Frame::new()
+                            .fill(Color32::from_rgb(22, 25, 35))
+                            .corner_radius(egui::CornerRadius::same(10))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(RichText::new("SESSION").small().strong().color(accent));
+                                    ui.label(RichText::new(format!("Track {} of {}", position + 1, self.queue.len())).small().color(Color32::GRAY));
+                                });
+                                let stats = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                                let listening_summary = if stats.plays == 0 {
+                                    "First time playing".to_string()
+                                } else {
+                                    format!("{} plays · {} finishes", stats.plays, stats.completions)
+                                };
+                                ui.label(RichText::new(listening_summary).small().color(Color32::from_rgb(160, 166, 181)));
+                            });
                     }
                     ui.add_space(12.0);
                     ui.horizontal(|ui| {
@@ -3759,24 +4242,36 @@ impl PlayerApp {
                             })
                             .collect::<Vec<_>>();
                         let queue_is_empty = queue_items.is_empty();
+                        let current_is_queued = current_position
+                            .is_some_and(|position| self.queue.get(position).is_some());
+                        let after_current = queue_items
+                            .len()
+                            .saturating_sub(usize::from(current_is_queued));
                         ui.horizontal(|ui| {
-                            ui.heading("Up next");
-                            ui.label(
-                                RichText::new(format!("{} tracks", queue_items.len()))
+                            ui.vertical(|ui| {
+                                ui.heading("Listening queue");
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} total · {} after the current track",
+                                        self.queue.len(), after_current
+                                    ))
                                     .small()
                                     .color(Color32::GRAY),
-                            );
-                            if !played_items.is_empty() && ui.small_button("Queue again").clicked()
-                            {
-                                queue_again_all =
-                                    played_items.iter().map(|(_, index, _)| *index).collect();
+                                );
+                            });
+                        });
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(!queue_items.is_empty(), egui::Button::new("Save as playlist")).clicked() {
+                                save_queue_playlist = true;
+                            }
+                            if ui.add_enabled(after_current > 1, egui::Button::new("⇄ Shuffle upcoming")).clicked() {
+                                shuffle_upcoming = true;
+                            }
+                            if ui.add_enabled(after_current > 0, egui::Button::new("Clear upcoming")).clicked() {
+                                clear_upcoming = true;
                             }
                         });
-                        ui.label(
-                            RichText::new("Your queue, followed by music picked for you.")
-                                .small()
-                                .color(Color32::GRAY),
-                        );
+                        ui.label(RichText::new("Playing now is included in the queue total; the second number counts tracks after it.").small().color(Color32::from_rgb(145, 151, 166)));
                         ui.add_space(8.0);
                         egui::ScrollArea::vertical()
                             .id_salt("now-playing-up-next")
@@ -3786,14 +4281,24 @@ impl PlayerApp {
                                     let selected = Some(position) == current_position;
                                     egui::Frame::new()
                                         .fill(if selected {
-                                            accent.linear_multiply(0.18)
+                                            accent.linear_multiply(0.09)
                                         } else {
                                             Color32::TRANSPARENT
+                                        })
+                                        .stroke(if selected {
+                                            egui::Stroke::new(1.0_f32, accent.linear_multiply(0.30))
+                                        } else {
+                                            egui::Stroke::NONE
                                         })
                                         .corner_radius(egui::CornerRadius::same(8))
                                         .inner_margin(egui::Margin::symmetric(8, 5))
                                         .show(ui, |ui| {
                                             ui.horizontal(|ui| {
+                                                ui.label(
+                                                    RichText::new(if selected { "♫" } else { "·" })
+                                                        .strong()
+                                                        .color(if selected { accent } else { Color32::DARK_GRAY }),
+                                                );
                                                 if let Some(texture) =
                                                     self.artwork_texture(ui.ctx(), index)
                                                 {
@@ -3852,12 +4357,32 @@ impl PlayerApp {
                                 }
                                 if queue_is_empty {
                                     ui.add_space(18.0);
-                                    ui.label("Nothing is queued after this song.");
-                                    ui.label(
-                                        RichText::new("Switch to For you to build a radio queue.")
-                                            .small()
-                                            .color(Color32::GRAY),
-                                    );
+                                    ui.label("Nothing is in the active queue yet.");
+                                }
+                                ui.add_space(14.0);
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.heading("Picked for you");
+                                    ui.label(RichText::new("Not queued · add any you like").small().color(Color32::GRAY));
+                                });
+                                for &index in suggestions.iter().take(8) {
+                                    let Some(track) = self.tracks.get(index).cloned() else { continue; };
+                                    ui.horizontal(|ui| {
+                                        if let Some(texture) = self.artwork_texture(ui.ctx(), index) {
+                                            ui.add(egui::Image::new(&texture).fit_to_exact_size(Vec2::splat(38.0)).corner_radius(egui::CornerRadius::same(5)));
+                                        } else {
+                                            let (rect, _) = ui.allocate_exact_size(Vec2::splat(38.0), egui::Sense::hover());
+                                            paint_cover_or_placeholder(ui, None, rect, index);
+                                        }
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(&track.title).strong());
+                                            ui.label(RichText::new(display_credit(&track.artist)).small().color(Color32::GRAY));
+                                        });
+                                        if ui.small_button("＋ Add").clicked() { add_recommendation = Some(index); }
+                                    });
+                                }
+                                if suggestions.is_empty() {
+                                    ui.label(RichText::new("Play more music to build personal picks.").small().color(Color32::GRAY));
                                 }
                                 if !played_items.is_empty() {
                                     ui.add_space(14.0);
@@ -3865,10 +4390,13 @@ impl PlayerApp {
                                     ui.horizontal(|ui| {
                                         ui.heading("Queue again");
                                         ui.label(
-                                            RichText::new("Previously played")
+                                            RichText::new(format!("{} previously played", played_items.len()))
                                                 .small()
                                                 .color(Color32::GRAY),
                                         );
+                                        if ui.small_button("Queue all again").clicked() {
+                                            queue_again_all = played_items.iter().map(|(_, index, _)| *index).collect();
+                                        }
                                     });
                                     for (position, index, track) in played_items {
                                         ui.horizontal(|ui| {
@@ -3910,6 +4438,16 @@ impl PlayerApp {
                     NowPlayingTab::ForYou => {
                         ui.horizontal(|ui| {
                             ui.heading("Picked for you");
+                            egui::ComboBox::from_id_salt("session-length")
+                                .selected_text(format!("{} min", self.session_target_minutes))
+                                .show_ui(ui, |ui| {
+                                    for minutes in [30, 45, 60, 90] {
+                                        ui.selectable_value(&mut self.session_target_minutes, minutes, format!("{minutes} minutes"));
+                                    }
+                                });
+                            if ui.button("Build session").on_hover_text("Create a queue near this length using your current recommendations").clicked() {
+                                build_session = true;
+                            }
                             if ui.button("▶  Play radio").clicked() {
                                 play_radio = true;
                             }
@@ -3971,6 +4509,19 @@ impl PlayerApp {
                                         if ui.small_button("Add").clicked() {
                                             add_recommendation = Some(index);
                                         }
+                                        ui.vertical(|ui| {
+                                            ui.label(RichText::new(self.recommendation_reason(index, &listened_artists)).small().color(Color32::GRAY));
+                                            ui.horizontal(|ui| {
+                                                let more = self.recommendation_feedback.get(&track.path) == Some(&1);
+                                                let less = self.recommendation_feedback.get(&track.path) == Some(&-1);
+                                                if ui.selectable_label(more, "More like this").clicked() {
+                                                    recommendation_feedback_action = Some((index, 1));
+                                                }
+                                                if ui.selectable_label(less, "Less like this").clicked() {
+                                                    recommendation_feedback_action = Some((index, -1));
+                                                }
+                                            });
+                                        });
                                     });
                                 }
                                 if suggestions.is_empty() {
@@ -3978,13 +4529,19 @@ impl PlayerApp {
                                 }
                             });
                     }
-                    NowPlayingTab::Visualizer => self.show_visualizer(ui, current_index),
                     NowPlayingTab::Lyrics => self.show_expanded_lyrics(ui),
                 });
         });
 
         if close_view {
             self.now_playing_expanded = false;
+        }
+        if let Some((index, rating)) = recommendation_feedback_action {
+            self.set_recommendation_feedback(index, rating);
+        }
+        if build_session {
+            self.start_listening_session(self.session_target_minutes);
+            self.now_playing_tab = NowPlayingTab::UpNext;
         }
         if let Some(position) = play_queue_position {
             self.play_queue_at(position);
@@ -4008,6 +4565,36 @@ impl PlayerApp {
         if add_radio {
             self.add_tracks_to_queue(&suggestions);
         }
+        if clear_upcoming {
+            self.cancel_crossfade();
+            if let Some(position) = self.current {
+                self.queue.truncate(position.saturating_add(1));
+                self.status = "Cleared upcoming tracks; the current song will keep playing.".into();
+            } else {
+                self.queue.clear();
+                self.status = "Cleared the queue.".into();
+            }
+            if self.queue.is_empty() {
+                self.resume_queue_paths.clear();
+                self.resume_current_path = None;
+                self.resume_position_seconds = 0.0;
+            }
+            self.save_state();
+        }
+        if shuffle_upcoming {
+            self.cancel_crossfade();
+            let start = self.current.map_or(0, |position| position.saturating_add(1));
+            if start < self.queue.len() {
+                shuffle_slice(&mut self.queue[start..]);
+                self.status = "Shuffled the upcoming tracks.".into();
+                self.save_state();
+            }
+        }
+        if save_queue_playlist {
+            let start = self.current.unwrap_or(0).min(self.queue.len());
+            let current_and_upcoming = self.queue.iter().skip(start).copied().collect::<Vec<_>>();
+            self.create_playlist_from_tracks("Listening session", &current_and_upcoming);
+        }
         if play_radio && !suggestions.is_empty() {
             self.play_indices(suggestions, 0);
             self.now_playing_tab = NowPlayingTab::UpNext;
@@ -4019,58 +4606,6 @@ impl PlayerApp {
             if dislike_current {
                 self.toggle_song_reaction(index, false);
             }
-        }
-    }
-
-    fn show_visualizer(&self, ui: &mut egui::Ui, current_index: Option<usize>) {
-        ui.heading("Visualizer");
-        ui.label(
-            RichText::new("A gentle animated pulse that follows playback.")
-                .small()
-                .color(Color32::GRAY),
-        );
-        ui.add_space(12.0);
-        let (rect, _) = ui.allocate_exact_size(
-            Vec2::new(ui.available_width(), ui.available_height().max(220.0)),
-            egui::Sense::hover(),
-        );
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(12),
-            Color32::from_rgb(11, 13, 20),
-        );
-        let playing = self
-            .sink
-            .as_ref()
-            .is_some_and(|sink| !sink.is_paused() && !sink.empty());
-        let focused = ui.ctx().input(|input| input.focused);
-        let phase = if self.animations_enabled && playing && focused {
-            ui.ctx().input(|input| input.time) as f32
-        } else {
-            0.0
-        };
-        let bars = 48;
-        let gap = 3.0;
-        let bar_width = (rect.width() - gap * (bars as f32 - 1.0)) / bars as f32;
-        let seed = current_index.unwrap_or(0) as f32 * 0.17;
-        for bar in 0..bars {
-            let center_weight = 1.0 - ((bar as f32 / (bars - 1) as f32) - 0.5).abs() * 1.6;
-            let wave = ((phase * 2.6 + bar as f32 * 0.42 + seed).sin() * 0.5 + 0.5) * 0.65 + 0.25;
-            let height =
-                (rect.height() * center_weight.max(0.18) * wave).clamp(10.0, rect.height() - 24.0);
-            let x = rect.left() + bar as f32 * (bar_width + gap);
-            let bar_rect = egui::Rect::from_min_size(
-                egui::pos2(x, rect.center().y - height * 0.5),
-                Vec2::new(bar_width.max(2.0), height),
-            );
-            ui.painter().rect_filled(
-                bar_rect,
-                egui::CornerRadius::same(3),
-                accent_color(&self.accent).linear_multiply(0.45 + wave * 0.55),
-            );
-        }
-        if playing && self.animations_enabled && focused {
-            ui.ctx().request_repaint_after(Duration::from_millis(40));
         }
     }
 
@@ -4108,7 +4643,7 @@ impl PlayerApp {
             .copied()
             .filter(valid)
             .collect::<Vec<_>>();
-        let familiar = self
+        let mut familiar_ranked = self
             .tracks
             .iter()
             .enumerate()
@@ -4118,9 +4653,34 @@ impl PlayerApp {
                     && (self.liked_songs.contains(&track.path)
                         || history_paths.contains(&track.path))
             })
-            .map(|(index, _)| index)
-            .take(80)
+            .map(|(index, track)| {
+                let engagement = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                let plays = engagement.plays.max(1) as f32;
+                let completion = (engagement.completions as f32 / plays).clamp(0.0, 1.0);
+                let skips = (engagement.skips as f32 / plays).clamp(0.0, 1.0);
+                let replay = (engagement.replays as f32 / plays).clamp(0.0, 1.0);
+                let liked = if self.liked_songs.contains(&track.path) { 5.0 } else { 0.0 };
+                (index, liked + (engagement.plays as f32).ln_1p() * 1.6 + completion * 3.0 + replay * 1.2 - skips * 3.5)
+            })
             .collect::<Vec<_>>();
+        familiar_ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let familiar = familiar_ranked.into_iter().take(80).map(|(index, _)| index).collect::<Vec<_>>();
+        let recent_paths = self.history.iter().take(30).cloned().collect::<HashSet<_>>();
+        let mut rediscover_ranked = self.tracks.iter().enumerate()
+            .filter(|(_, track)| !self.excluded_tracks.contains(&track.path)
+                && !self.disliked_songs.contains(&track.path)
+                && !recent_paths.contains(&track.path))
+            .filter_map(|(index, track)| {
+                let engagement = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                let plays = engagement.plays.max(1) as f32;
+                let completion = (engagement.completions as f32 / plays).clamp(0.0, 1.0);
+                let replay = (engagement.replays as f32 / plays).clamp(0.0, 1.0);
+                let saved = self.liked_songs.contains(&track.path);
+                (engagement.plays > 0 && (completion > 0.45 || replay > 0.0 || saved))
+                    .then_some((index, completion * 3.0 + replay * 1.5 + if saved { 2.0 } else { 0.0 } + (engagement.plays as f32).ln_1p()))
+            }).collect::<Vec<_>>();
+        rediscover_ranked.sort_by(|left, right| right.1.total_cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        let rediscover = rediscover_ranked.into_iter().take(80).map(|(index, _)| index).collect::<Vec<_>>();
         let discovered = recommendations
             .iter()
             .copied()
@@ -4142,6 +4702,11 @@ impl PlayerApp {
                 "Familiar favorites".to_string(),
                 "Songs and artists you return to most.".to_string(),
                 familiar,
+            ),
+            (
+                "Rediscover".to_string(),
+                "Tracks you finished or replayed, ready for another spin.".to_string(),
+                rediscover,
             ),
             (
                 "Fresh discoveries".to_string(),
@@ -4348,6 +4913,22 @@ impl PlayerApp {
                     self.save_state();
                 }
                 ui.label(RichText::new("AI runs only when clicked. Google receives compact title, artist, genre, and liked/played/new labels for available tracks; no paths or audio. Full-library requests use more tokens.").small().color(Color32::GRAY));
+                egui::CollapsingHeader::new("Preview request data")
+                    .default_open(false)
+                    .show(ui, |ui| {
+                        let candidates = self.ai_mix_candidates();
+                        ui.label(format!("Model: {} · requested mix size: {} · catalog rows: {}", self.google_ai_model.label(), self.ai_mix_size, candidates.len()));
+                        ui.label(RichText::new("Prompt").strong());
+                        let prompt = if self.ai_mix_prompt.trim().is_empty() { "a balanced mix based on my music taste" } else { self.ai_mix_prompt.trim() };
+                        ui.label(compact_metadata(prompt, 120));
+                        ui.label(RichText::new("Catalog columns: row ID, title, artist, genre, familiarity (liked/played/new), and compact behavior flags for likes, followed artists, saved albums, heard percentage, plays, completions, early skips, replays, and backward seeks. File paths and audio are omitted.").small().color(Color32::GRAY));
+                        ui.label(RichText::new(format!("Preview · first {} of {} rows", candidates.len().min(30), candidates.len())).small().strong());
+                        egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                            for (row, candidate) in candidates.iter().take(30).enumerate() {
+                                ui.label(format!("{} · {} — {} · {} · {} · {}", row, candidate.title, candidate.artist, candidate.genre, candidate.familiarity, candidate.engagement));
+                            }
+                        });
+                    });
                 ui.horizontal(|ui| {
                     ui.add(egui::TextEdit::singleline(&mut self.ai_mix_prompt).desired_width(ui.available_width() - 130.0).hint_text("e.g. energetic electronic for a night drive"));
                     if ui.add_enabled(!self.ai_mix_pending, egui::Button::new(if self.ai_mix_pending { "Making…" } else { "Create mix" })).clicked() {
@@ -4651,14 +5232,27 @@ impl PlayerApp {
                 .first()
                 .and_then(|&index| self.artwork_texture(ui.ctx(), index))
         };
+        let liked = if is_artist {
+            self.liked_artists.contains(&title.to_lowercase())
+        } else {
+            self.liked_albums.contains(&title.to_lowercase())
+        };
         let mut play_collection = false;
-        ui.group(|ui| {
+        let mut save_collection = false;
+        let mut queue_collection = false;
+        egui::Frame::new()
+            .fill(Color32::from_rgb(20, 23, 33))
+            .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(47, 53, 70)))
+            .corner_radius(egui::CornerRadius::same(14))
+            .inner_margin(egui::Margin::same(16))
+            .show(ui, |ui| {
             ui.horizontal(|ui| {
-                let (cover_rect, _) =
-                    ui.allocate_exact_size(Vec2::splat(132.0), egui::Sense::hover());
+                let (cover_rect, _) = ui.allocate_exact_size(Vec2::splat(156.0), egui::Sense::hover());
                 paint_cover_or_placeholder(ui, cover.as_ref(), cover_rect, tracks.len());
+                ui.add_space(8.0);
                 ui.vertical(|ui| {
-                    ui.heading(RichText::new(&title).size(27.0).strong());
+                    ui.label(RichText::new(if is_artist { "ARTIST" } else { "ALBUM" }).small().strong().color(accent_color(&self.accent)));
+                    ui.heading(RichText::new(&title).size(30.0).strong());
                     let metadata = if is_artist {
                         format!("{} tracks", tracks.len())
                     } else {
@@ -4671,18 +5265,22 @@ impl PlayerApp {
                         format!("{} · {} tracks", credits.join(", "), tracks.len())
                     };
                     ui.label(RichText::new(metadata).color(Color32::GRAY));
-                    if ui
-                        .add_sized([144.0, 42.0], egui::Button::new("▶  Play collection"))
-                        .clicked()
-                    {
-                        play_collection = true;
-                    }
+                    ui.add_space(10.0);
+                    ui.horizontal_wrapped(|ui| {
+                        if ui.add_sized([132.0, 40.0], egui::Button::new("▶  Play all").fill(accent_color(&self.accent))).clicked() { play_collection = true; }
+                        if ui.add_sized([124.0, 40.0], egui::Button::new(if liked { if is_artist { "♥ Following" } else { "♥ Saved" } } else if is_artist { "♡ Follow" } else { "♡ Save album" })).clicked() { save_collection = true; }
+                        if ui.add_sized([118.0, 40.0], egui::Button::new("＋  Add to queue")).clicked() { queue_collection = true; }
+                    });
                 });
             });
         });
+        if save_collection {
+            if is_artist { self.toggle_artist_like(&title); } else { self.toggle_album_like(&title); }
+        }
         if play_collection {
             self.play_all_indices(tracks.to_vec());
         }
+        if queue_collection { self.add_tracks_to_queue(tracks); }
         if is_artist {
             let albums = self.albums(tracks);
             if !albums.is_empty() {
@@ -4731,11 +5329,14 @@ impl PlayerApp {
             tracks: self.tracks.clone(),
             history: self.history.clone(),
             track_engagement: self.track_engagement.clone(),
+            recommendation_feedback: self.recommendation_feedback.clone(),
+            use_listening_history: self.use_listening_history,
             liked_songs: self.liked_songs.clone(),
             disliked_songs: self.disliked_songs.clone(),
             excluded_tracks: self.excluded_tracks.clone(),
             liked_artists: self.liked_artists.clone(),
             liked_albums: self.liked_albums.clone(),
+            favorite_genres: self.favorite_genres.clone(),
             discovery: self.discovery,
             prefer_unplayed: self.prefer_unplayed,
             recommendation_variety: self.recommendation_variety,
@@ -6706,6 +7307,8 @@ impl PlayerApp {
         let mut play = None;
         let mut artist_open = None;
         let mut album_open = None;
+        let mut follow_artist = None;
+        let mut save_album = None;
         let mut ask_ai = false;
         let mut history_open: Option<String> = None;
         let mut history_delete: Option<String> = None;
@@ -6982,6 +7585,8 @@ impl PlayerApp {
                                                             Color32::from_rgb(182, 185, 196),
                                                         ),
                                                     );
+                                                    let following = self.liked_artists.contains(&artist.to_lowercase());
+                                                    if ui.small_button(if following { "♥ Following" } else { "♡ Follow" }).clicked() { follow_artist = Some(artist.clone()); }
                                                 });
                                             });
                                             if open {
@@ -7029,6 +7634,8 @@ impl PlayerApp {
                                                         .size(14.0)
                                                         .color(Color32::from_rgb(182, 185, 196)),
                                                     );
+                                                    let saved = self.liked_albums.contains(&album.to_lowercase());
+                                                    if ui.small_button(if saved { "♥ Saved" } else { "♡ Save album" }).clicked() { save_album = Some(album.clone()); }
                                                 });
                                             });
                                             if open {
@@ -7082,6 +7689,8 @@ impl PlayerApp {
             self.search_suggestions_open = false;
             self.search_suggestions_focused = false;
         }
+        if let Some(artist) = follow_artist { self.toggle_artist_like(&artist); }
+        if let Some(album) = save_album { self.toggle_album_like(&album); }
         if ask_ai {
             self.remember_search(&query);
             self.search_ai_results.clear();
@@ -8197,22 +8806,21 @@ impl PlayerApp {
     }
 
     fn show_playlist_detail(&mut self, ui: &mut egui::Ui, tracks: &[usize]) {
-        let Some(total_count) = self
-            .selected_playlist
-            .and_then(|index| self.playlists.get(index))
-            .map(|playlist| playlist.tracks.len())
-        else {
+        let Some(playlist_index) = self.selected_playlist.filter(|&index| index < self.playlists.len()) else {
             self.selected_playlist = None;
             self.show_playlist_library(ui);
             return;
         };
+        let total_count = self.playlist_track_indices(playlist_index).len();
+        let smart_rule = self.playlists[playlist_index].rule;
         let mut play = false;
         let mut shuffle = false;
         let mut enqueue = false;
         let mut add_now_playing = false;
         ui.label(
             RichText::new(format!(
-                "{total_count} saved tracks · {} available in your library",
+            "{total_count} {} · {} available in your library",
+            if smart_rule.is_some() { "tracks from a smart rule" } else { "saved tracks" },
                 tracks.len()
             ))
             .color(Color32::GRAY),
@@ -8248,17 +8856,20 @@ impl PlayerApp {
             {
                 enqueue = true;
             }
-            if icon_text_button(ui, self.ui_icons.get("add"), "Add now playing", false).clicked() {
+            if smart_rule.is_none() && icon_text_button(ui, self.ui_icons.get("add"), "Add now playing", false).clicked() {
                 add_now_playing = true;
             }
         });
+        if let Some(rule) = smart_rule {
+            ui.label(RichText::new(format!("Smart playlist · {} · updates automatically", rule.label())).small().color(Color32::GRAY));
+        }
         if tracks.is_empty() {
             ui.label("This playlist has no available tracks. Add songs from the library or remove missing entries from its menu.");
         }
         if play {
-            self.play_indices(tracks.to_vec(), 0);
+            self.play_playlist(playlist_index, false);
         } else if shuffle {
-            self.play_shuffled_indices(tracks.to_vec());
+            self.play_playlist(playlist_index, true);
         } else if enqueue {
             self.add_tracks_to_queue(tracks);
         }
@@ -8271,6 +8882,7 @@ impl PlayerApp {
             if let (Some(path), Some(playlist)) = (
                 path,
                 self.selected_playlist
+                    .filter(|&index| self.playlists.get(index).is_some_and(|playlist| playlist.rule.is_none()))
                     .and_then(|index| self.playlists.get_mut(index)),
             ) {
                 if !playlist.tracks.contains(&path) {
@@ -8301,12 +8913,26 @@ impl PlayerApp {
                     self.playlists.push(Playlist {
                         name,
                         tracks: Vec::new(),
+                        rule: None,
                     });
                     self.selected_playlist = Some(self.playlists.len() - 1);
                     self.playlist_name.clear();
                     self.save_state();
                 }
             }
+        });
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_id_salt("smart-playlist-rule")
+                .selected_text(self.smart_playlist_rule.label())
+                .show_ui(ui, |ui| {
+                    for rule in [SmartPlaylistRule::LikedSongs, SmartPlaylistRule::FollowedArtists, SmartPlaylistRule::RecentlyAdded, SmartPlaylistRule::Rediscover, SmartPlaylistRule::FavoriteGenres] {
+                        ui.selectable_value(&mut self.smart_playlist_rule, rule, rule.label());
+                    }
+                });
+            if ui.button("Create smart playlist").clicked() {
+                self.create_smart_playlist(self.smart_playlist_rule);
+            }
+            ui.label(RichText::new("Updates automatically as your library and likes change.").small().color(Color32::GRAY));
         });
         ui.add_space(12.0);
         let mut open = None;
@@ -8325,22 +8951,46 @@ impl PlayerApp {
         let mut remove_playlist_tracks_from_library = None;
         let mut delete_playlist_files = None;
         for (index, playlist) in self.playlists.iter().enumerate() {
-            let response = ui.group(|ui| {
+            let playlist_track_count = self.playlist_track_indices(index).len();
+            let has_playable_tracks = playlist_track_count > 0;
+            let mut playlist_context_response = None;
+            ui.group(|ui| {
                 ui.horizontal(|ui| {
+                    let playlist_label = ui.selectable_label(
+                        false,
+                        format!(
+                            "{}  {} · {} tracks",
+                            if playlist.rule.is_some() { "↻" } else { "♫" },
+                            playlist.name,
+                            playlist_track_count
+                        ),
+                    );
+                    if playlist_label.clicked() {
+                        open = Some(index);
+                    }
+                    playlist_context_response = Some(playlist_label);
                     if ui
-                        .selectable_label(
-                            false,
-                            format!("♫  {} · {} tracks", playlist.name, playlist.tracks.len()),
-                        )
+                        .add_enabled(has_playable_tracks, egui::Button::new("▶ Play"))
+                        .on_hover_text(if has_playable_tracks {
+                            "Play this playlist from the first track"
+                        } else {
+                            "This playlist has no available tracks"
+                        })
                         .clicked()
                     {
                         open = Some(index);
-                    }
-                    if ui.small_button("▶ Play").clicked() {
-                        open = Some(index);
                         play = true;
                     }
-                    if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle", false)
+                    if ui
+                        .add_enabled(
+                            has_playable_tracks,
+                            egui::Button::new("⤨ Shuffle").small(),
+                        )
+                        .on_hover_text(if has_playable_tracks {
+                            "Shuffle this playlist and play"
+                        } else {
+                            "This playlist has no available tracks"
+                        })
                         .clicked()
                     {
                         open = Some(index);
@@ -8351,25 +9001,46 @@ impl PlayerApp {
                     }
                 })
             });
-            response.response.context_menu(|ui| {
-                if ui.button("▶  Play playlist").clicked() {
+            // Keep the context-menu hit target on the playlist name. Anchoring it
+            // to the whole group creates a later click-sensitive widget over the
+            // inline buttons, which prevents their hover and click responses.
+            if let Some(response) = playlist_context_response {
+                response.context_menu(|ui| {
+                if ui
+                    .add_enabled(has_playable_tracks, egui::Button::new("▶  Play playlist"))
+                    .clicked()
+                {
                     open = Some(index);
                     play = true;
                     ui.close_menu();
                 }
-                if icon_text_button(ui, self.ui_icons.get("shuffle"), "Shuffle and play", false)
+                if ui
+                    .add_enabled(
+                        has_playable_tracks,
+                        egui::Button::new("⤨  Shuffle and play"),
+                    )
                     .clicked()
                 {
                     open = Some(index);
                     shuffle_play = true;
                     ui.close_menu();
                 }
-                if ui.button("♫  Add playlist to queue").clicked() {
+                if ui
+                    .add_enabled(
+                        has_playable_tracks,
+                        egui::Button::new("♫  Add playlist to queue"),
+                    )
+                    .clicked()
+                {
                     open = Some(index);
                     enqueue = true;
                     ui.close_menu();
                 }
-                if icon_text_button(ui, self.ui_icons.get("next"), "Play playlist next", false)
+                if ui
+                    .add_enabled(
+                        has_playable_tracks,
+                        egui::Button::new("▶  Play playlist next"),
+                    )
                     .clicked()
                 {
                     open = Some(index);
@@ -8396,9 +9067,11 @@ impl PlayerApp {
                         ui.close_menu();
                     }
                 });
-                if ui.button("Remove missing tracks").clicked() {
-                    remove_missing = Some(index);
-                    ui.close_menu();
+                if playlist.rule.is_none() {
+                    if ui.button("Remove missing tracks").clicked() {
+                        remove_missing = Some(index);
+                        ui.close_menu();
+                    }
                 }
                 if ui.button("Open playlist").clicked() {
                     open = Some(index);
@@ -8412,38 +9085,29 @@ impl PlayerApp {
                     duplicate = Some(index);
                     ui.close_menu();
                 }
-                if icon_text_button(
-                    ui,
-                    self.ui_icons.get("add"),
-                    "Add currently playing song",
-                    false,
-                )
-                .clicked()
-                {
-                    add_playing_to_playlist = Some(index);
-                    ui.close_menu();
-                }
-                ui.separator();
-                if ui.button("Empty playlist (keep library files)").clicked() {
-                    empty_playlist = Some(index);
-                    ui.close_menu();
-                }
-                if ui
-                    .button("Remove all playlist songs from library (keep files)")
-                    .clicked()
-                {
-                    remove_playlist_tracks_from_library = Some(index);
-                    ui.close_menu();
-                }
-                if ui
-                    .button(
-                        RichText::new("Delete all playlist audio files permanently…")
-                            .color(Color32::LIGHT_RED),
-                    )
-                    .clicked()
-                {
-                    delete_playlist_files = Some(index);
-                    ui.close_menu();
+                if playlist.rule.is_none() {
+                    if icon_text_button(
+                        ui,
+                        self.ui_icons.get("add"),
+                        "Add currently playing song",
+                        false,
+                    ).clicked() {
+                        add_playing_to_playlist = Some(index);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Empty playlist (keep library files)").clicked() {
+                        empty_playlist = Some(index);
+                        ui.close_menu();
+                    }
+                    if ui.button("Remove all playlist songs from library (keep files)").clicked() {
+                        remove_playlist_tracks_from_library = Some(index);
+                        ui.close_menu();
+                    }
+                    if ui.button(RichText::new("Delete all playlist audio files permanently…").color(Color32::LIGHT_RED)).clicked() {
+                        delete_playlist_files = Some(index);
+                        ui.close_menu();
+                    }
                 }
                 ui.separator();
                 if ui
@@ -8453,7 +9117,8 @@ impl PlayerApp {
                     delete = Some(index);
                     ui.close_menu();
                 }
-            });
+                });
+            }
         }
         if let Some(index) = add_playing_to_playlist {
             let path = self
@@ -8565,10 +9230,10 @@ impl PlayerApp {
         }
         if let Some(index) = copy_track_list {
             if let Some(playlist) = self.playlists.get(index) {
-                let listing = playlist
-                    .tracks
+                let listing = self.playlist_track_indices(index)
                     .iter()
-                    .map(|path| path.to_string_lossy().into_owned())
+                    .filter_map(|&track_index| self.tracks.get(track_index))
+                    .map(|track| track.path.to_string_lossy().into_owned())
                     .collect::<Vec<_>>()
                     .join("\n");
                 ui.ctx().copy_text(listing);
@@ -8588,7 +9253,9 @@ impl PlayerApp {
         if let Some((index, format)) = export {
             if let Some(playlist) = self.playlists.get(index) {
                 let name = playlist.name.clone();
-                let tracks = playlist.tracks.clone();
+                let tracks = self.playlist_track_indices(index).iter()
+                    .filter_map(|&track_index| self.tracks.get(track_index).map(|track| track.path.clone()))
+                    .collect::<Vec<_>>();
                 let result = match format {
                     PlaylistExportFormat::Folder => rfd::FileDialog::new()
                         .set_title("Choose where to export the playlist folder")
@@ -8620,26 +9287,45 @@ impl PlayerApp {
             }
         }
         if let Some(index) = open {
-            self.selected_playlist = Some(index);
-            let tracks = self.indices_for_paths(&self.playlists[index].tracks.clone());
             if play || shuffle_play {
-                if !tracks.is_empty() {
-                    if shuffle_play {
-                        self.play_shuffled_indices(tracks);
-                    } else {
-                        self.play_indices(tracks, 0);
-                    }
-                }
+                self.play_playlist(index, shuffle_play);
             } else if enqueue {
+                self.selected_playlist = Some(index);
+                let tracks = self.playlist_track_indices(index);
                 self.add_tracks_to_queue(&tracks);
             } else if play_next {
+                self.selected_playlist = Some(index);
+                let tracks = self.playlist_track_indices(index);
                 self.queue_tracks_next(&tracks);
+            } else {
+                self.selected_playlist = Some(index);
             }
         }
         if let Some(index) = delete {
-            self.playlists.remove(index);
-            self.selected_playlist = None;
-            self.save_state();
+            if index < self.playlists.len() {
+                let name = self.playlists[index].name.clone();
+                self.playlists.remove(index);
+                self.selected_playlist = self.selected_playlist.and_then(|selected| {
+                    if selected == index {
+                        None
+                    } else if selected > index {
+                        Some(selected - 1)
+                    } else {
+                        Some(selected)
+                    }
+                });
+                self.renaming_playlist = self.renaming_playlist.and_then(|renaming| {
+                    if renaming == index {
+                        None
+                    } else if renaming > index {
+                        Some(renaming - 1)
+                    } else {
+                        Some(renaming)
+                    }
+                });
+                self.save_state();
+                self.status = format!("Deleted playlist {name}. Its audio files were kept.");
+            }
         }
     }
 
@@ -8648,6 +9334,171 @@ impl PlayerApp {
             .id_salt("settings-content")
             .auto_shrink([false, false])
             .show(ui, |ui| self.show_settings_content(ui));
+    }
+
+    fn export_taste_profile(&mut self, preferences: &Preferences) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Lilt taste profile", &["json"])
+            .set_file_name("lilt-taste-profile.json")
+            .save_file()
+        else { return; };
+        let profile = TasteProfileBackup {
+            version: 1,
+            favorite_genres: preferences.favorite_genres.iter().cloned().collect(),
+            liked_artists: preferences.liked_artists.iter().cloned().collect(),
+            liked_albums: preferences.liked_albums.iter().cloned().collect(),
+            discovery: preferences.discovery,
+            prefer_unplayed: preferences.prefer_unplayed,
+            recommendation_variety: preferences.recommendation_variety,
+            recommendation_size: preferences.recommendation_size,
+            use_listening_history: preferences.use_listening_history,
+        };
+        match serde_json::to_vec_pretty(&profile).map_err(|error| error.to_string())
+            .and_then(|bytes| fs::write(&path, bytes).map_err(|error| error.to_string())) {
+            Ok(()) => self.status = format!("Exported taste profile to {}.", path.display()),
+            Err(error) => self.status = format!("Could not export taste profile: {error}"),
+        }
+    }
+
+    fn import_taste_profile(&mut self) -> Option<TasteProfileBackup> {
+        let path = rfd::FileDialog::new()
+            .add_filter("Lilt taste profile", &["json"])
+            .pick_file()?;
+        let profile = fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|contents| serde_json::from_str::<TasteProfileBackup>(&contents).map_err(|error| error.to_string()));
+        match profile {
+            Ok(profile) if profile.version == 1 => Some(profile),
+            Ok(_) => {
+                self.status = "This taste profile version is not supported.".into();
+                None
+            }
+            Err(error) => {
+                self.status = format!("Could not import taste profile: {error}");
+                None
+            }
+        }
+    }
+
+    fn export_local_snapshot(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Lilt settings snapshot", &["json"])
+            .set_file_name("lilt-settings-snapshot.json")
+            .save_file()
+        else { return; };
+        let result = serde_json::to_vec_pretty(&self.preferences_snapshot())
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| fs::write(&path, bytes).map_err(|error| error.to_string()));
+        self.status = match result {
+            Ok(()) => format!("Exported full settings snapshot to {}.", path.display()),
+            Err(error) => format!("Could not export settings snapshot: {error}"),
+        };
+    }
+
+    fn restore_local_snapshot(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Lilt settings snapshot", &["json"])
+            .pick_file()
+        else { return; };
+        let parsed = fs::read(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|bytes| serde_json::from_slice::<Preferences>(&bytes).map_err(|error| error.to_string()));
+        let preferences = match parsed {
+            Ok(preferences) => preferences,
+            Err(error) => {
+                self.status = format!("Could not restore settings snapshot: {error}");
+                return;
+            }
+        };
+        self.welcome_completed = preferences.welcome_completed;
+        self.welcome_open = !self.welcome_completed;
+        self.folders = preferences.folders;
+        self.favorite_genres = preferences.favorite_genres;
+        self.liked_songs = preferences.liked_songs;
+        self.disliked_songs = preferences.disliked_songs;
+        self.liked_artists = preferences.liked_artists;
+        self.liked_albums = preferences.liked_albums;
+        self.playlists = preferences.playlists;
+        self.history = preferences.history;
+        self.track_engagement = preferences.track_engagement;
+        self.recommendation_feedback = preferences.recommendation_feedback;
+        self.search_history = preferences.search_history.into_iter().take(5).collect();
+        self.excluded_tracks = preferences.excluded_tracks;
+        self.view_mode = preferences.view_mode;
+        self.album_view_mode = preferences.album_view_mode;
+        self.artist_view_mode = preferences.artist_view_mode;
+        self.accent = if preferences.accent.is_empty() { "Rose".into() } else { preferences.accent };
+        self.shuffle = preferences.shuffle;
+        self.repeat = preferences.repeat;
+        self.smart_queue_mode = preferences.smart_queue_mode;
+        self.use_listening_history = preferences.use_listening_history;
+        self.track_fade_seconds = preferences.track_fade_seconds.clamp(0.0, 8.0);
+        self.replay_gain_mode = preferences.replay_gain_mode;
+        self.discovery = preferences.discovery.clamp(0.0, 1.0);
+        self.prefer_unplayed = preferences.prefer_unplayed;
+        self.recommendation_variety = preferences.recommendation_variety.clamp(0.0, 1.0);
+        self.recommendation_size = preferences.recommendation_size.clamp(20, 100);
+        self.ai_recommendations_enabled = preferences.ai_recommendations_enabled;
+        self.google_ai_model = preferences.google_ai_model;
+        self.google_ai_thinking = preferences.google_ai_thinking;
+        self.ai_mix_size = preferences.ai_mix_size.clamp(50, 200);
+        self.ai_mix_include_liked = preferences.ai_mix_include_liked;
+        self.ai_mix_include_played = preferences.ai_mix_include_played;
+        self.ai_mix_include_unplayed = preferences.ai_mix_include_unplayed;
+        self.google_ai_usage = preferences.google_ai_usage;
+        self.google_ai_requests = preferences.google_ai_requests;
+        self.google_ai_last_usage = preferences.google_ai_last_usage;
+        self.ui_scale = preferences.ui_scale.clamp(75.0, 150.0);
+        self.volume = preferences.volume.clamp(0.0, 1.0);
+        self.duplicate_scan_enabled = preferences.duplicate_scan_enabled;
+        self.duplicate_check_exact = preferences.duplicate_check_exact;
+        self.duplicate_check_recordings = preferences.duplicate_check_recordings;
+        self.duplicate_check_partial = preferences.duplicate_check_partial;
+        self.deleted_songs = preferences.deleted_songs;
+        self.auto_purge_deleted = preferences.auto_purge_deleted;
+        self.scan_rate_per_second = preferences.scan_rate_per_second.min(100_000);
+        self.daily_mix_paths = std::array::from_fn(|index| preferences.daily_mixes.get(index).cloned().unwrap_or_default());
+        self.queue.clear();
+        self.resume_queue_paths = preferences.session_queue;
+        self.resume_current_path = preferences.session_current;
+        self.resume_position_seconds = preferences.session_position_seconds.max(0.0);
+        self.queue_collapsed = !preferences.show_queue_on_start;
+        self.compact_mode = preferences.compact_mode;
+        self.start_maximized = preferences.start_maximized;
+        self.animations_enabled = preferences.animations_enabled;
+        self.lyrics_enabled = preferences.lyrics_enabled;
+        self.default_app_prompt_open = !preferences.default_app_prompt_dismissed;
+        self.fetch_online_artwork = preferences.fetch_online_artwork;
+        self.online_artwork_prompt_seen = preferences.online_artwork_prompt_seen;
+        self.developer_console_enabled = preferences.developer_console_enabled;
+        self.ai_audit_check_duplicates = preferences.ai_audit_check_duplicates;
+        self.ai_audit_check_artist_mismatches = preferences.ai_audit_check_artist_mismatches;
+        self.settings_draft = None;
+        self.settings_category = "Library".into();
+        self.selected_playlist = None;
+        self.selected_artist = None;
+        self.selected_album = None;
+        self.cancel_crossfade();
+        self.sink = None;
+        self.stream = None;
+        self.current = None;
+        self.playback_offset = Duration::ZERO;
+        self.lyrics = None;
+        self.lyrics_error = None;
+        self.recommendations.clear();
+        self.ai_recommendation_indices.clear();
+        self.home_data_revision = self.home_data_revision.wrapping_add(1);
+        self.home_job_receiver = None;
+        self.mix_refresh_running = false;
+        self.scan_issues.clear();
+        self.scan_issue_count = 0;
+        self.recommendations_dirty = true;
+        self.home_cache_dirty = true;
+        self.scan_receiver = None;
+        self.scan_busy = false;
+        self.start_scan();
+        self.save_state();
+        self.status = format!("Restored settings snapshot from {} and rescanning its library folders.", path.display());
     }
 
     fn show_settings_content(&mut self, ui: &mut egui::Ui) {
@@ -8664,6 +9515,9 @@ impl PlayerApp {
             .unwrap_or_else(|| self.preferences_snapshot());
         let mut save = false;
         let mut discard = false;
+        let mut reopen_welcome = false;
+        let mut export_snapshot = false;
+        let mut restore_snapshot = false;
         ui.horizontal_wrapped(|ui| {
             for category in [
                 "Appearance",
@@ -8768,6 +9622,9 @@ impl PlayerApp {
                     "Prioritize songs I haven't played",
                 );
                 ui.end_row();
+                ui.label(RichText::new("Listening history").strong());
+                ui.checkbox(&mut draft.use_listening_history, "Use plays, finishes, skips, and recent music for recommendations");
+                ui.end_row();
                 ui.label(RichText::new("Mix variety").strong());
                 ui.horizontal(|ui| {
                     ui.label("Similar");
@@ -8785,6 +9642,50 @@ impl PlayerApp {
                         .suffix(" songs"),
                 );
                 ui.end_row();
+                let mut genre_counts = HashMap::<String, usize>::new();
+                for track in &self.tracks {
+                    if !is_unknown(&track.genre) {
+                        *genre_counts.entry(track.genre.trim().to_owned()).or_default() += 1;
+                    }
+                }
+                let mut genres = genre_counts.into_iter().collect::<Vec<_>>();
+                genres.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+                genres.truncate(16);
+                ui.label(RichText::new("Favorite genres").strong());
+                ui.horizontal_wrapped(|ui| {
+                    for (genre, _) in genres {
+                        let key = genre.to_lowercase();
+                        let selected = draft.favorite_genres.contains(&key);
+                        if ui.selectable_label(selected, genre).clicked() {
+                            if !draft.favorite_genres.remove(&key) { draft.favorite_genres.insert(key); }
+                        }
+                    }
+                });
+                ui.end_row();
+                ui.label(RichText::new("Taste profile").strong());
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} favorite genres · {} followed artists · {} saved albums", draft.favorite_genres.len(), draft.liked_artists.len(), draft.liked_albums.len())).small().color(Color32::GRAY));
+                    ui.label(RichText::new("Profiles contain explicit preferences and mix controls; they exclude file paths and listening history.").small().color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        if ui.button("Export profile…").clicked() {
+                            self.export_taste_profile(&draft);
+                        }
+                        if ui.button("Import profile…").clicked() {
+                            if let Some(profile) = self.import_taste_profile() {
+                                draft.favorite_genres = profile.favorite_genres.into_iter().map(|genre| genre.to_lowercase()).collect();
+                                draft.liked_artists = profile.liked_artists.into_iter().map(|artist| artist.to_lowercase()).collect();
+                                draft.liked_albums = profile.liked_albums.into_iter().map(|album| album.to_lowercase()).collect();
+                                draft.discovery = profile.discovery.clamp(0.0, 1.0);
+                                draft.prefer_unplayed = profile.prefer_unplayed;
+                                draft.recommendation_variety = profile.recommendation_variety.clamp(0.0, 1.0);
+                                draft.recommendation_size = profile.recommendation_size.clamp(20, 100);
+                                draft.use_listening_history = profile.use_listening_history;
+                                save = true;
+                            }
+                        }
+                    });
+                });
+                ui.end_row();
                 }
                 if playback_settings {
                 ui.label(RichText::new("Playback").strong());
@@ -8801,6 +9702,33 @@ impl PlayerApp {
                 ui.end_row();
                 ui.label(RichText::new("Queue on startup").strong());
                 ui.checkbox(&mut draft.show_queue_on_start, "Open Up next when Lilt starts");
+                ui.end_row();
+                ui.label(RichText::new("Track transitions").strong());
+                ui.horizontal(|ui| {
+                    ui.add(egui::Slider::new(&mut draft.track_fade_seconds, 0.0..=8.0).step_by(0.5).suffix(" sec"));
+                    ui.label(RichText::new("Fade song edges").small().color(Color32::GRAY));
+                });
+                ui.end_row();
+                ui.label(RichText::new("Volume leveling").strong());
+                ui.vertical(|ui| {
+                    egui::ComboBox::from_id_salt("replay-gain-mode")
+                        .selected_text(draft.replay_gain_mode.label())
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut draft.replay_gain_mode, ReplayGainMode::Off, "Off");
+                            ui.selectable_value(&mut draft.replay_gain_mode, ReplayGainMode::Track, "Track gain");
+                            ui.selectable_value(&mut draft.replay_gain_mode, ReplayGainMode::Album, "Album gain");
+                        });
+                    ui.label(RichText::new("Uses ReplayGain tags when present; missing tags play at normal volume.").small().color(Color32::GRAY));
+                });
+                ui.end_row();
+                ui.label(RichText::new("Smart Queue").strong());
+                egui::ComboBox::from_id_salt("smart-queue-mode")
+                    .selected_text(draft.smart_queue_mode.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut draft.smart_queue_mode, SmartQueueMode::Off, "Off");
+                        ui.selectable_value(&mut draft.smart_queue_mode, SmartQueueMode::WhenQueueEnds, "Continue when queue ends");
+                        ui.selectable_value(&mut draft.smart_queue_mode, SmartQueueMode::KeepThreeReady, "Keep 3 recommendations ready");
+                    });
                 ui.end_row();
                 ui.label(RichText::new("Default volume").strong());
                 ui.add(
@@ -8840,6 +9768,9 @@ impl PlayerApp {
                     for (index, folder) in self.folders.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(folder.display().to_string());
+                            let exists = folder.is_dir();
+                            let count = self.tracks.iter().filter(|track| track.path.starts_with(folder)).count();
+                            ui.label(RichText::new(if exists { format!("Available · {count} tracks") } else { "Missing folder".into() }).small().color(if exists { Color32::from_rgb(120, 195, 145) } else { Color32::from_rgb(238, 164, 92) }));
                             if ui.small_button("Remove").clicked() {
                                 remove_folder = Some(index);
                             }
@@ -8858,6 +9789,28 @@ impl PlayerApp {
                         self.save_state();
                         self.start_scan();
                     }
+                    if self.scan_issue_count > 0 {
+                        ui.add_space(6.0);
+                        ui.label(RichText::new(format!("{} scan issue(s) · {} shown", self.scan_issue_count, self.scan_issues.len())).color(Color32::from_rgb(238, 164, 92)));
+                        egui::CollapsingHeader::new("Review scan issues").id_salt("scan-health-issues").show(ui, |ui| {
+                            for issue in self.scan_issues.iter().take(50) {
+                                ui.label(RichText::new(issue).small().color(Color32::GRAY));
+                            }
+                            if self.scan_issues.len() > 50 {
+                                ui.label(RichText::new(format!("{} more issues not shown", self.scan_issues.len() - 50)).small().color(Color32::GRAY));
+                            }
+                        });
+                    } else if !self.scan_busy && !self.folders.is_empty() {
+                        ui.label(RichText::new("No issues reported in the last scan.").small().color(Color32::from_rgb(120, 195, 145)));
+                    }
+                });
+                ui.end_row();
+                }
+                if library_settings {
+                ui.label(RichText::new("Getting started").strong());
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Review the welcome and setup steps again.").small().color(Color32::GRAY));
+                    reopen_welcome = ui.button("Show welcome experience").clicked();
                 });
                 ui.end_row();
                 }
@@ -8874,8 +9827,31 @@ impl PlayerApp {
                     }
                 });
                 ui.end_row();
+                ui.label(RichText::new("On-device data").strong());
+                ui.vertical(|ui| {
+                    ui.label(RichText::new(format!("{} tracks · {} playlists · {} recent plays · {} song reactions · {} recommendation notes", self.tracks.len(), self.playlists.len(), self.history.len(), self.liked_songs.len() + self.disliked_songs.len(), self.recommendation_feedback.len())).small().color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Listening and recommendation data stays on this device unless you choose Mix Studio.").small().color(Color32::GRAY));
+                        if ui.add_enabled(!self.recommendation_feedback.is_empty(), egui::Button::new("Clear recommendation notes")).clicked() {
+                            self.recommendation_feedback.clear();
+                            self.recommendations_dirty = true;
+                            self.home_cache_dirty = true;
+                            self.save_state();
+                        }
+                    });
+                });
+                ui.end_row();
                 ui.label(RichText::new("Lyrics").strong());
                 ui.checkbox(&mut draft.lyrics_enabled, "Enable optional .lrc lyrics support");
+                ui.end_row();
+                ui.label(RichText::new("Settings snapshot").strong());
+                ui.vertical(|ui| {
+                    ui.label(RichText::new("A full snapshot includes local folder paths, playlists, likes, and listening history. Keep the file private.").small().color(Color32::GRAY));
+                    ui.horizontal(|ui| {
+                        export_snapshot = ui.button("Export snapshot…").clicked();
+                        restore_snapshot = ui.button("Restore snapshot…").clicked();
+                    });
+                });
                 ui.end_row();
                 }
             });
@@ -9221,6 +10197,9 @@ impl PlayerApp {
             || draft.accent != self.accent
             || draft.shuffle != self.shuffle
             || draft.repeat != self.repeat
+            || draft.smart_queue_mode != self.smart_queue_mode
+            || (draft.track_fade_seconds - self.track_fade_seconds).abs() > f32::EPSILON
+            || draft.replay_gain_mode != self.replay_gain_mode
             || draft.show_queue_on_start != !self.queue_collapsed
             || draft.compact_mode != self.compact_mode
             || draft.start_maximized != self.start_maximized
@@ -9231,6 +10210,8 @@ impl PlayerApp {
             || draft.fetch_online_artwork != self.fetch_online_artwork
             || draft.lyrics_enabled != self.lyrics_enabled
             || draft.prefer_unplayed != self.prefer_unplayed
+            || draft.use_listening_history != self.use_listening_history
+            || draft.favorite_genres != self.favorite_genres
             || draft.scan_rate_per_second != self.scan_rate_per_second;
         if auto_save && !manual_save {
             draft.ui_scale = self.ui_scale;
@@ -9248,6 +10229,9 @@ impl PlayerApp {
             self.accent = draft.accent.clone();
             self.shuffle = draft.shuffle;
             self.repeat = draft.repeat;
+            self.smart_queue_mode = draft.smart_queue_mode;
+            self.track_fade_seconds = draft.track_fade_seconds.clamp(0.0, 8.0);
+            self.replay_gain_mode = draft.replay_gain_mode;
             self.queue_collapsed = !draft.show_queue_on_start;
             self.compact_mode = draft.compact_mode;
             self.start_maximized = draft.start_maximized;
@@ -9288,13 +10272,15 @@ impl PlayerApp {
             }
             self.discovery = draft.discovery;
             self.prefer_unplayed = draft.prefer_unplayed;
+            self.use_listening_history = draft.use_listening_history;
+            self.favorite_genres = draft.favorite_genres.clone();
             self.recommendation_variety = draft.recommendation_variety.clamp(0.0, 1.0);
             self.recommendation_size = draft.recommendation_size.clamp(20, 100);
             self.ui_scale = draft.ui_scale.clamp(75.0, 150.0);
             self.volume = draft.volume.clamp(0.0, 1.0);
             self.scan_rate_per_second = draft.scan_rate_per_second.min(100_000);
             if let Some(sink) = &self.sink {
-                sink.set_volume(self.volume);
+                sink.set_volume(self.current_output_volume());
             }
             ui.ctx()
                 .send_viewport_cmd(egui::ViewportCommand::Maximized(self.start_maximized));
@@ -9314,6 +10300,18 @@ impl PlayerApp {
             draft.recommendation_size = staged_sliders.3;
             draft.volume = staged_sliders.4;
             self.settings_draft = Some(draft);
+        }
+        if reopen_welcome {
+            self.settings_draft = None;
+            self.welcome_step = 0;
+            self.welcome_open = true;
+            self.page = Page::Home;
+        }
+        if export_snapshot {
+            self.export_local_snapshot();
+        }
+        if restore_snapshot {
+            self.restore_local_snapshot();
         }
     }
 
@@ -9348,6 +10346,37 @@ impl PlayerApp {
         self.mix_context().compute_recommendations()
     }
 
+    fn ai_mix_candidates(&self) -> Vec<AiMixCandidate> {
+        (0..self.tracks.len())
+            .filter_map(|index| {
+                let track = self.tracks.get(index)?;
+                if self.excluded_tracks.contains(&track.path) || self.disliked_songs.contains(&track.path) {
+                    return None;
+                }
+                let liked = self.liked_songs.contains(&track.path);
+                let played = self.history.contains(&track.path);
+                let followed_artist = artist_names(&track.artist).iter().any(|artist| self.liked_artists.contains(&artist.to_lowercase()));
+                let saved_album = self.liked_albums.contains(&track.album.to_lowercase());
+                let stats = self.track_engagement.get(&track.path).copied().unwrap_or_default();
+                let heard_percent = if track.duration > 0.0 {
+                    (stats.listened_seconds / (track.duration * stats.plays.max(1) as f64) * 100.0).round().clamp(0.0, 100.0) as u8
+                } else { 0 };
+                let included = (liked && self.ai_mix_include_liked)
+                    || (played && self.ai_mix_include_played)
+                    || (!liked && !played && self.ai_mix_include_unplayed);
+                if !included { return None; }
+                Some(AiMixCandidate {
+                    index,
+                    title: compact_metadata(&track.title, 64),
+                    artist: compact_metadata(&display_credit(&track.artist), 48),
+                    genre: compact_metadata(&track.genre, 32),
+                    familiarity: if liked { "L" } else if played { "P" } else { "N" },
+                    engagement: format!("l{}f{}a{}h{}p{}c{}s{}r{}b{}", u8::from(liked), u8::from(followed_artist), u8::from(saved_album), heard_percent, stats.plays.min(99), stats.completions.min(9), stats.skips.min(9), stats.replays.min(9), stats.seek_backs.min(9)),
+                })
+            })
+            .collect()
+    }
+
     fn request_ai_mix(&mut self, context: &egui::Context) {
         if self.ai_mix_pending {
             return;
@@ -9376,63 +10405,9 @@ impl PlayerApp {
             self.ai_mix_status = "Choose at least one music group in Mix options.".into();
             return;
         }
-        // Include the whole available local catalog. The old 48-track cap meant
-        // large libraries only exposed their first recommendation cluster.
-        let candidates = (0..self.tracks.len())
-            .filter_map(|index| {
-                let track = self.tracks.get(index)?;
-                if self.excluded_tracks.contains(&track.path)
-                    || self.disliked_songs.contains(&track.path)
-                {
-                    return None;
-                }
-                let liked = self.liked_songs.contains(&track.path);
-                let played = self.history.contains(&track.path);
-                let followed_artist = artist_names(&track.artist)
-                    .iter()
-                    .any(|artist| self.liked_artists.contains(&artist.to_lowercase()));
-                let saved_album = self.liked_albums.contains(&track.album.to_lowercase());
-                let stats = self.track_engagement.get(&track.path).copied().unwrap_or_default();
-                let heard_percent = if track.duration > 0.0 {
-                    (stats.listened_seconds / (track.duration * stats.plays.max(1) as f64) * 100.0)
-                        .round()
-                        .clamp(0.0, 100.0) as u8
-                } else {
-                    0
-                };
-                let included = (liked && self.ai_mix_include_liked)
-                    || (played && self.ai_mix_include_played)
-                    || (!liked && !played && self.ai_mix_include_unplayed);
-                if !included {
-                    return None;
-                }
-                Some(AiMixCandidate {
-                    index,
-                    title: compact_metadata(&track.title, 64),
-                    artist: compact_metadata(&display_credit(&track.artist), 48),
-                    genre: compact_metadata(&track.genre, 32),
-                    familiarity: if liked {
-                        "L"
-                    } else if played {
-                        "P"
-                    } else {
-                        "N"
-                    },
-                    engagement: format!(
-                        "l{}f{}a{}h{}p{}c{}s{}r{}b{}",
-                        u8::from(liked),
-                        u8::from(followed_artist),
-                        u8::from(saved_album),
-                        heard_percent,
-                        stats.plays.min(99),
-                        stats.completions.min(9),
-                        stats.skips.min(9),
-                        stats.replays.min(9),
-                        stats.seek_backs.min(9),
-                    ),
-                })
-            })
-            .collect::<Vec<_>>();
+        // Include the whole available local catalog, and use this same builder
+        // in the preview so the displayed scope matches the request.
+        let candidates = self.ai_mix_candidates();
         if candidates.is_empty() {
             self.ai_mix_status = "Add a few songs to your library first.".into();
             return;
@@ -9698,7 +10673,7 @@ impl PlayerApp {
             .iter()
             .filter_map(|&index| self.tracks.get(index).map(|track| track.path.clone()))
             .collect::<Vec<_>>();
-        self.playlists.push(Playlist { name, tracks });
+        self.playlists.push(Playlist { name, tracks, rule: None });
         self.save_state();
         self.status = "Saved the Mix Studio picks as a playlist.".into();
     }

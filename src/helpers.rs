@@ -606,6 +606,8 @@ fn scan_folders_with_settings(
                 errors.join("; ")
             ))
         },
+        issue_count: errors.len(),
+        issues: errors.iter().take(200).cloned().collect(),
         auto_deleted_count,
         auto_delete_failures,
         auto_deleted_paths,
@@ -644,6 +646,8 @@ fn read_track(
             track.artist = tag.artist().unwrap_or_default().to_string();
             track.album = tag.album().unwrap_or_default().to_string();
             track.genre = tag.genre().unwrap_or_default().to_string();
+            track.replay_gain_track_db = tag.get_string(&ItemKey::ReplayGainTrackGain).and_then(parse_replay_gain_db);
+            track.replay_gain_album_db = tag.get_string(&ItemKey::ReplayGainAlbumGain).and_then(parse_replay_gain_db);
             track.artwork = tag.pictures().first().and_then(|picture| {
                 let data = picture.data();
                 if data.is_empty() || data.len() > MAX_CACHED_ARTWORK_BYTES {
@@ -679,6 +683,11 @@ fn read_track(
     )
     .to_lowercase();
     track
+}
+
+fn parse_replay_gain_db(value: &str) -> Option<f32> {
+    let normalized = value.trim().strip_suffix("dB").unwrap_or(value).trim();
+    normalized.parse::<f32>().ok().filter(|gain| gain.is_finite())
 }
 
 fn online_artwork_cache_path(artist: &str, album: &str) -> Result<PathBuf, String> {
@@ -2074,7 +2083,7 @@ fn animated_nav_item(
     icon: Option<&TextureHandle>,
     selected: bool,
     accent: Color32,
-) -> bool {
+) -> egui::Response {
     let (rect, response) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click());
     let selected_t =
@@ -2125,9 +2134,7 @@ fn animated_nav_item(
         egui::FontId::proportional(14.0),
         text_color,
     );
-    response
-        .on_hover_cursor(egui::CursorIcon::PointingHand)
-        .clicked()
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
 fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
