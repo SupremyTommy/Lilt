@@ -1,7 +1,7 @@
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
      xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
   <Package Name="Lilt" Manufacturer="SupremyTommy"
-           Version="0.2.36" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
+           Version="0.3.0" UpgradeCode="F110A099-815C-4A86-8DAC-4E7AD7E8D394"
            Scope="perUser" InstallerVersion="500">
     <MajorUpgrade DowngradeErrorMessage="A newer version of Lilt is already installed." />
     <MediaTemplate EmbedCab="yes" />
@@ -27,8 +27,9 @@
       <Feature Id="DesktopShortcutFeature" Title="Desktop shortcut" Description="Add Lilt to the Desktop." Level="1">
         <ComponentRef Id="DesktopShortcutComponent" />
       </Feature>
-      <Feature Id="ExplorerContextMenuFeature" Title="File Explorer context menu" Description="Add Open folder with Lilt to folder background menus." Level="1">
+      <Feature Id="ExplorerContextMenuFeature" Title="File Explorer context menu" Description="Add Quick Play and Open folder with Lilt to Explorer menus." Level="1">
         <ComponentRef Id="LiltExplorerBackground" />
+        <ComponentRef Id="LiltQuickPlay" />
       </Feature>
       <Feature Id="AudioFileRegistrationFeature" Title="Windows audio file registration" Description="Make Lilt available in Windows Open with and default-app choices for supported audio files. This does not change your current default player." Level="1">
         <ComponentRef Id="LiltFileAssociations" />
@@ -41,17 +42,17 @@
       <Directory Id="ProgramsFolder" Name="Programs">
         <Directory Id="INSTALLFOLDER" Name="Lilt">
           <Component Id="LiltExecutable" Guid="*">
-            <File Id="LiltExe" Source="dist/Lilt-v0.2.36-windows-x64/lilt-player.exe" KeyPath="yes" />
+            <File Id="LiltExe" Source="dist/Lilt-v0.3.0-windows-x64/lilt-player.exe" KeyPath="yes" />
             <RegistryValue Root="HKCU" Key="Software\SupremyTommy\Lilt" Name="Installed" Type="integer" Value="1" />
           </Component>
           <Component Id="LiltPngIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.36-windows-x64/app_icon.png" />
+            <File Source="dist/Lilt-v0.3.0-windows-x64/app_icon.png" />
           </Component>
           <Component Id="LiltIcoIcon" Guid="*">
-            <File Source="dist/Lilt-v0.2.36-windows-x64/app_icon.ico" />
+            <File Source="dist/Lilt-v0.3.0-windows-x64/app_icon.ico" />
           </Component>
           <Component Id="LiltReadme" Guid="*">
-            <File Source="dist/Lilt-v0.2.36-windows-x64/README.md" />
+            <File Source="dist/Lilt-v0.3.0-windows-x64/README.md" />
           </Component>
           <Component Id="LiltExplorerBackground" Guid="*">
             <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer">
@@ -60,6 +61,29 @@
             </RegistryKey>
             <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltPlayer\command">
               <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; --folder &quot;%V&quot;" KeyPath="yes" />
+            </RegistryKey>
+          </Component>
+          <Component Id="LiltQuickPlay" Guid="*">
+            <RegistryKey Root="HKCU" Key="Software\Classes\SystemFileAssociations\audio\shell\LiltQuickPlay">
+              <RegistryValue Type="string" Value="Quick Play with Lilt" />
+              <RegistryValue Name="Icon" Type="string" Value="[#LiltExe]" />
+              <RegistryKey Key="command">
+                <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; --quick-play &quot;%1&quot;" KeyPath="yes" />
+              </RegistryKey>
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\shell\LiltQuickPlay">
+              <RegistryValue Type="string" Value="Quick Play folder with Lilt" />
+              <RegistryValue Name="Icon" Type="string" Value="[#LiltExe]" />
+              <RegistryKey Key="command">
+                <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; --quick-play &quot;%1&quot;" />
+              </RegistryKey>
+            </RegistryKey>
+            <RegistryKey Root="HKCU" Key="Software\Classes\Directory\Background\shell\LiltQuickPlay">
+              <RegistryValue Type="string" Value="Quick Play this folder with Lilt" />
+              <RegistryValue Name="Icon" Type="string" Value="[#LiltExe]" />
+              <RegistryKey Key="command">
+                <RegistryValue Type="string" Value="&quot;[#LiltExe]&quot; --quick-play &quot;%V&quot;" />
+              </RegistryKey>
             </RegistryKey>
           </Component>
           <Component Id="LiltFileAssociations" Guid="*">

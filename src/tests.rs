@@ -544,6 +544,62 @@ mod tests {
     }
 
     #[test]
+    fn background_music_settings_round_trip() {
+        let preferences = Preferences {
+            background_music_enabled: true,
+            background_autoplay: false,
+            background_loop: false,
+            background_source_label: "Playlist · Focus".into(),
+            background_paths: vec![PathBuf::from("one.mp3")],
+            smart_duck_enabled: false,
+            smart_duck_level: 0.3,
+            smart_duck_fade_seconds: 1.4,
+            start_in_background: true,
+            start_with_windows: true,
+            keep_running_in_background: true,
+            explorer_quick_play: true,
+            ..Preferences::default()
+        };
+        let encoded = serde_json::to_string(&preferences).expect("settings serialize");
+        let decoded: Preferences = serde_json::from_str(&encoded).expect("settings deserialize");
+        assert!(decoded.background_music_enabled);
+        assert!(!decoded.background_autoplay);
+        assert!(!decoded.background_loop);
+        assert_eq!(decoded.background_source_label, "Playlist · Focus");
+        assert_eq!(decoded.background_paths, [PathBuf::from("one.mp3")]);
+        assert!(!decoded.smart_duck_enabled);
+        assert_eq!(decoded.smart_duck_level, 0.3);
+        assert_eq!(decoded.smart_duck_fade_seconds, 1.4);
+        assert!(decoded.start_in_background);
+        assert!(decoded.start_with_windows);
+        assert!(decoded.keep_running_in_background);
+        assert!(decoded.explorer_quick_play);
+    }
+
+    #[test]
+    fn quick_play_collects_only_audio_files_from_a_folder() {
+        let directory = std::env::temp_dir().join(format!(
+            "lilt-quick-play-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock moves forward")
+                .as_nanos()
+        ));
+        fs::create_dir_all(directory.join("nested")).expect("create quick play folder");
+        fs::write(directory.join("one.mp3"), b"not real audio").expect("write mp3");
+        fs::write(directory.join("nested/two.FLAC"), b"not real audio").expect("write flac");
+        fs::write(directory.join("notes.txt"), b"ignore me").expect("write text");
+
+        let (files, is_folder) = collect_quick_play_files(&directory);
+        assert!(is_folder);
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().any(|path| path.ends_with("one.mp3")));
+        assert!(files.iter().any(|path| path.ends_with("two.FLAC")));
+        fs::remove_dir_all(directory).expect("remove quick play folder");
+    }
+
+    #[test]
     fn restored_queue_snapshot_keeps_saved_position_before_playback_resumes() {
         let mut app = PlayerApp::new();
         app.resume_queue_paths = vec![PathBuf::from("one.mp3"), PathBuf::from("two.mp3")];
@@ -722,5 +778,195 @@ mod tests {
             .expect("seek test WAV");
         let sample = decoder.next().expect("sample after seek");
         assert!((499..=501).contains(&sample));
+    }
+
+    #[test]
+    fn library_cache_round_trips_metadata_without_artwork_bytes() {
+        let tracks = vec![Track {
+            path: PathBuf::from("C:/Music/song.mp3"),
+            title: "Song".into(),
+            artist: "Artist".into(),
+            album: "Album".into(),
+            genre: "Genre".into(),
+            year: 2024,
+            added: 10,
+            duration: 123.5,
+            size_bytes: 4096,
+            modified_ms: 12_345,
+            has_embedded_artwork: true,
+            replay_gain_track_db: Some(-2.0),
+            artwork: Some(Arc::new(vec![1, 2, 3])),
+            ..Track::default()
+        }];
+        let bytes = encode_library_cache(&[PathBuf::from("C:/Music")], &tracks)
+            .expect("encode library cache");
+        let decoded = decode_library_cache(&bytes).expect("decode library cache");
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].size_bytes, 4096);
+        assert_eq!(decoded[0].modified_ms, 12_345);
+        assert!(decoded[0].has_embedded_artwork);
+        assert!(decoded[0].artwork.is_none());
+        assert!(decoded[0].search_text.contains("song"));
+        assert!(decode_library_cache(b"not a library index").is_none());
+    }
+
+    #[test]
+    fn duplicate_signature_tracks_metadata_and_likes() {
+        let tracks = vec![Track {
+            path: PathBuf::from("a.mp3"),
+            size_bytes: 10,
+            modified_ms: 20,
+            ..Track::default()
+        }];
+        let mut liked = HashSet::new();
+        let first = duplicate_scan_signature(&tracks, &liked);
+        liked.insert(PathBuf::from("a.mp3"));
+        assert_ne!(first, duplicate_scan_signature(&tracks, &liked));
+        liked.clear();
+        let mut changed = tracks.clone();
+        changed[0].size_bytes = 11;
+        assert_ne!(first, duplicate_scan_signature(&changed, &liked));
+    }
+
+    #[test]
+    fn incremental_scan_reuses_unchanged_reads_changed_and_prunes_deleted() {
+        let directory = duplicate_test_directory();
+        let first = directory.join("first.mp3");
+        let second = directory.join("second.mp3");
+        fs::write(&first, b"first fake song").expect("write first file");
+        fs::write(&second, b"second fake song").expect("write second file");
+
+        let full = scan_folders(&[directory.clone()], &[], false);
+        assert_eq!(full.tracks.len(), 2);
+        assert_eq!(full.tag_reads, 2);
+        let cache = Arc::new(
+            full.tracks
+                .iter()
+                .cloned()
+                .map(|track| (track.path.clone(), track))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let unchanged = scan_folders_with_settings(
+            &[directory.clone()],
+            &[],
+            false,
+            0,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::clone(&cache)),
+            false,
+            false,
+        );
+        assert_eq!(unchanged.tracks.len(), 2);
+        assert_eq!(unchanged.tag_reads, 0);
+        assert_eq!(unchanged.reused_tracks, 2);
+
+        fs::write(&first, b"first fake song grew").expect("change first file");
+        let changed = scan_folders_with_settings(
+            &[directory.clone()],
+            &[],
+            false,
+            0,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::new(
+                unchanged
+                    .tracks
+                    .iter()
+                    .cloned()
+                    .map(|track| (track.path.clone(), track))
+                    .collect::<HashMap<_, _>>(),
+            )),
+            false,
+            false,
+        );
+        assert_eq!(changed.tracks.len(), 2);
+        assert_eq!(changed.tag_reads, 1);
+        assert_eq!(changed.reused_tracks, 1);
+
+        fs::remove_file(&second).expect("remove second file");
+        let pruned = scan_folders_with_settings(
+            &[directory.clone()],
+            &[],
+            false,
+            0,
+            Arc::new(AtomicUsize::new(0)),
+            Some(Arc::new(
+                changed
+                    .tracks
+                    .iter()
+                    .cloned()
+                    .map(|track| (track.path.clone(), track))
+                    .collect::<HashMap<_, _>>(),
+            )),
+            false,
+            false,
+        );
+        assert_eq!(pruned.tracks.len(), 1);
+        assert_eq!(pruned.tag_reads, 0);
+        assert_eq!(pruned.reused_tracks, 1);
+
+        fs::remove_dir_all(directory).expect("remove test directory");
+    }
+
+    #[test]
+    #[ignore = "manual startup benchmark"]
+    fn startup_benchmark_cold_scan_vs_cached_check() {
+        let directory = duplicate_test_directory();
+        for index in 0..800 {
+            fs::write(
+                directory.join(format!("track-{index}.mp3")),
+                format!("fake audio payload {index}"),
+            )
+            .expect("write benchmark file");
+        }
+
+        let cold_started = std::time::Instant::now();
+        let full = scan_folders(&[directory.clone()], &[], false);
+        let cold_elapsed = cold_started.elapsed();
+        let encode_started = std::time::Instant::now();
+        let cache_bytes = encode_library_cache(&[directory.clone()], &full.tracks)
+            .expect("encode benchmark cache");
+        let encode_elapsed = encode_started.elapsed();
+        let decode_started = std::time::Instant::now();
+        let decoded = decode_library_cache(&cache_bytes).expect("decode benchmark cache");
+        let decode_elapsed = decode_started.elapsed();
+        let cache = Arc::new(
+            full.tracks
+                .iter()
+                .cloned()
+                .map(|track| (track.path.clone(), track))
+                .collect::<HashMap<_, _>>(),
+        );
+
+        let warm_started = std::time::Instant::now();
+        let cached = scan_folders_with_settings(
+            &[directory.clone()],
+            &[],
+            false,
+            0,
+            Arc::new(AtomicUsize::new(0)),
+            Some(cache),
+            false,
+            false,
+        );
+        let warm_elapsed = warm_started.elapsed();
+        println!(
+            "cold scan: {:?} ({} tag reads) · cached check: {:?} ({} tag reads, {} reused)",
+            cold_elapsed,
+            full.tag_reads,
+            warm_elapsed,
+            cached.tag_reads,
+            cached.reused_tracks
+        );
+        println!(
+            "library index ({} tracks, {} bytes): encode {:?} · decode {:?}",
+            decoded.len(),
+            cache_bytes.len(),
+            encode_elapsed,
+            decode_elapsed
+        );
+        assert_eq!(cached.tracks.len(), full.tracks.len());
+        assert_eq!(cached.tag_reads, 0);
+        fs::remove_dir_all(directory).expect("remove benchmark directory");
     }
 }

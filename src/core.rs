@@ -383,6 +383,12 @@ struct Track {
     added: u64,
     duration: f64,
     #[serde(default)]
+    size_bytes: u64,
+    #[serde(default)]
+    modified_ms: u64,
+    #[serde(default)]
+    has_embedded_artwork: bool,
+    #[serde(default)]
     replay_gain_track_db: Option<f32>,
     #[serde(default)]
     replay_gain_album_db: Option<f32>,
@@ -702,6 +708,30 @@ struct Preferences {
     ai_audit_check_duplicates: bool,
     #[serde(default = "default_true")]
     ai_audit_check_artist_mismatches: bool,
+    #[serde(default)]
+    background_music_enabled: bool,
+    #[serde(default = "default_true")]
+    background_autoplay: bool,
+    #[serde(default = "default_true")]
+    background_loop: bool,
+    #[serde(default)]
+    background_source_label: String,
+    #[serde(default)]
+    background_paths: Vec<PathBuf>,
+    #[serde(default = "default_true")]
+    smart_duck_enabled: bool,
+    #[serde(default = "default_duck_level")]
+    smart_duck_level: f32,
+    #[serde(default = "default_duck_fade_seconds")]
+    smart_duck_fade_seconds: f32,
+    #[serde(default)]
+    start_in_background: bool,
+    #[serde(default)]
+    start_with_windows: bool,
+    #[serde(default)]
+    keep_running_in_background: bool,
+    #[serde(default)]
+    explorer_quick_play: bool,
 }
 
 impl Default for Preferences {
@@ -768,8 +798,28 @@ impl Default for Preferences {
             developer_console_enabled: false,
             ai_audit_check_duplicates: true,
             ai_audit_check_artist_mismatches: true,
+            background_music_enabled: false,
+            background_autoplay: true,
+            background_loop: true,
+            background_source_label: String::new(),
+            background_paths: Vec::new(),
+            smart_duck_enabled: true,
+            smart_duck_level: default_duck_level(),
+            smart_duck_fade_seconds: default_duck_fade_seconds(),
+            start_in_background: false,
+            start_with_windows: false,
+            keep_running_in_background: false,
+            explorer_quick_play: false,
         }
     }
+}
+
+fn default_duck_level() -> f32 {
+    0.25
+}
+
+fn default_duck_fade_seconds() -> f32 {
+    0.8
 }
 
 fn default_discovery() -> f32 {
@@ -904,6 +954,9 @@ struct ScanResult {
     auto_deleted_count: usize,
     auto_delete_failures: usize,
     auto_deleted_paths: Vec<PathBuf>,
+    tag_reads: usize,
+    reused_tracks: usize,
+    cache_error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1111,6 +1164,9 @@ pub struct PlayerApp {
     welcome_step: u8,
     welcome_completed: bool,
     tracks: Vec<Track>,
+    track_index_by_path: HashMap<PathBuf, usize>,
+    cache_hint: Option<Arc<HashMap<PathBuf, Track>>>,
+    warm_start: bool,
     folders: Vec<PathBuf>,
     liked_songs: HashSet<PathBuf>,
     disliked_songs: HashSet<PathBuf>,
@@ -1245,6 +1301,9 @@ pub struct PlayerApp {
     duplicate_scan_receiver: Option<Receiver<DuplicateScanResult>>,
     duplicate_scan_cancel: Option<Arc<AtomicBool>>,
     duplicate_scan_busy: bool,
+    duplicate_scan_signature: Option<u64>,
+    duplicate_scan_pending_signature: Option<u64>,
+    duplicate_scan_due: Option<Instant>,
     duplicate_groups: Vec<DuplicateGroup>,
     duplicate_notice: bool,
     duplicate_review_open: bool,
@@ -1280,6 +1339,11 @@ pub struct PlayerApp {
     developer_output: VecDeque<String>,
     last_status_seen: String,
     splash_started: Instant,
+    preferences_dirty: bool,
+    preferences_dirty_since: Option<Instant>,
+    applied_theme_key: Option<(String, bool, bool)>,
+    applied_zoom: Option<f32>,
+    update_check_started: bool,
     error_notification: Option<(String, Instant)>,
     update_receiver: Receiver<UpdateMessage>,
     update_sender: Sender<UpdateMessage>,
@@ -1297,5 +1361,48 @@ pub struct PlayerApp {
     media_controls_initialized: bool,
     #[cfg(target_os = "windows")]
     published_media_state: Option<(Option<PathBuf>, bool)>,
+    background_music_enabled: bool,
+    background_autoplay: bool,
+    background_loop: bool,
+    background_source_label: String,
+    background_paths: Vec<PathBuf>,
+    background_track_query: String,
+    smart_duck_enabled: bool,
+    smart_duck_level: f32,
+    smart_duck_fade_seconds: f32,
+    start_in_background: bool,
+    start_with_windows: bool,
+    keep_running_in_background: bool,
+    explorer_quick_play: bool,
+    duck_gain: f32,
+    other_audio_active: bool,
+    other_audio_stopped_at: Option<Instant>,
+    audio_activity_receiver: Receiver<bool>,
+    audio_activity_last_tick: Instant,
+    pending_background_start: bool,
+    background_started: bool,
+    quick_play_receiver: Option<Receiver<QuickPlayResult>>,
+    quick_play_busy: bool,
+    quick_play_prompt: Option<PathBuf>,
+    quick_play_path: Option<PathBuf>,
+    quick_play_progress: Option<Arc<AtomicUsize>>,
+    ipc_receiver: Option<Receiver<LaunchRequest>>,
+    ipc_watcher_started: bool,
+    force_exit: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct LaunchOptions {
+    startup_folder: Option<PathBuf>,
+    startup_file: Option<PathBuf>,
+    quick_play: Option<PathBuf>,
+    background: bool,
+}
+
+struct QuickPlayResult {
+    path: PathBuf,
+    is_folder: bool,
+    tracks: Vec<Track>,
+    error: Option<String>,
 }
 

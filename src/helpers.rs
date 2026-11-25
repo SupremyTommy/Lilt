@@ -436,6 +436,7 @@ fn should_auto_remove_deleted_file(path: &Path, rules: &[DeletedFingerprintRule]
         .any(|rule| rule.fingerprint == fingerprint)
 }
 
+#[allow(dead_code)]
 fn scan_folders(
     folders: &[PathBuf],
     deleted_rules: &[DeletedFingerprintRule],
@@ -447,6 +448,9 @@ fn scan_folders(
         auto_purge_deleted,
         0,
         Arc::new(AtomicUsize::new(0)),
+        None,
+        true,
+        false,
     )
 }
 
@@ -456,20 +460,34 @@ fn scan_folders_with_settings(
     auto_purge_deleted: bool,
     scan_rate_per_second: usize,
     scan_progress: Arc<AtomicUsize>,
+    cached_tracks: Option<Arc<HashMap<PathBuf, Track>>>,
+    full_scan: bool,
+    save_cache: bool,
 ) -> ScanResult {
+    let scan_started = Instant::now();
     let mut errors = Vec::new();
     let mut auto_deleted_count = 0;
     let mut auto_delete_failures = 0;
     let mut auto_deleted_paths = Vec::new();
-    let mut audio_paths: Vec<PathBuf> = Vec::new();
-    let mut pending = folders.to_vec();
+    let mut audio_files: Vec<(PathBuf, u64, u64)> = Vec::new();
+    let mut seen_paths = HashSet::new();
+    // Track whether a folder is one the user selected. Subfolders come and go
+    // during a scan (archives, temp extraction folders), so a missing subfolder
+    // is not an error worth interrupting the user over.
+    let mut pending = folders
+        .iter()
+        .cloned()
+        .map(|folder| (folder, true))
+        .collect::<Vec<_>>();
 
     // Phase 1: walk the folders (cheap) and apply the deleted-song protection.
-    while let Some(folder) = pending.pop() {
+    while let Some((folder, is_root)) = pending.pop() {
         let entries = match fs::read_dir(&folder) {
             Ok(entries) => entries,
             Err(error) => {
-                errors.push(format!("{}: {error}", folder.display()));
+                if error.kind() != std::io::ErrorKind::NotFound || is_root {
+                    errors.push(format!("{}: {error}", folder.display()));
+                }
                 continue;
             }
         };
@@ -477,7 +495,9 @@ fn scan_folders_with_settings(
             let entry = match entry {
                 Ok(entry) => entry,
                 Err(error) => {
-                    errors.push(format!("{}: {error}", folder.display()));
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        errors.push(format!("{}: {error}", folder.display()));
+                    }
                     continue;
                 }
             };
@@ -485,12 +505,14 @@ fn scan_folders_with_settings(
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
                 Err(error) => {
-                    errors.push(format!("{}: {error}", path.display()));
+                    if error.kind() != std::io::ErrorKind::NotFound {
+                        errors.push(format!("{}: {error}", path.display()));
+                    }
                     continue;
                 }
             };
             if file_type.is_dir() {
-                pending.push(path);
+                pending.push((path, false));
             } else if file_type.is_file() && is_audio_file(&path) {
                 if auto_purge_deleted && should_auto_remove_deleted_file(&path, deleted_rules) {
                     match fs::remove_file(&path) {
@@ -509,80 +531,114 @@ fn scan_folders_with_settings(
                         }
                     }
                 }
-                audio_paths.push(path);
+                if !seen_paths.insert(path.clone()) {
+                    continue;
+                }
+                let metadata = match entry.metadata() {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        if error.kind() != std::io::ErrorKind::NotFound {
+                            errors.push(format!("{}: {error}", path.display()));
+                        }
+                        continue;
+                    }
+                };
+                let modified_ms = metadata
+                    .modified()
+                    .ok()
+                    .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+                    .map_or(0, |duration| {
+                        duration.as_secs().saturating_mul(1_000)
+                            + duration.subsec_millis() as u64
+                    });
+                audio_files.push((path, metadata.len(), modified_ms));
             }
         }
     }
 
-    // Phase 2: read tags on several worker threads. This is the slow part of a
-    // scan (disk I/O plus tag parsing), so it is spread across cores. The rate
-    // limit (songs per second, 0 = unlimited) is shared by all workers.
-    let worker_count = thread::available_parallelism()
-        .map_or(4, |count| count.get())
-        .clamp(2, 8)
-        .min(audio_paths.len().max(1));
-    let next_path = AtomicUsize::new(0);
-    let pacer = Mutex::new((Instant::now(), 0usize));
-    let collected: Mutex<Vec<Track>> = Mutex::new(Vec::with_capacity(audio_paths.len()));
-    thread::scope(|scope| {
-        for _ in 0..worker_count {
-            scope.spawn(|| {
-                let mut artwork_cache = HashMap::<u64, Vec<Arc<Vec<u8>>>>::new();
-                let mut online_cover_cache =
-                    HashMap::<(String, String), Option<Arc<Vec<u8>>>>::new();
-                let mut local = Vec::new();
-                loop {
-                    let position = next_path.fetch_add(1, Ordering::Relaxed);
-                    let Some(path) = audio_paths.get(position) else {
-                        break;
-                    };
-                    if scan_rate_per_second > 0 {
-                        let mut window = pacer.lock().unwrap_or_else(|error| error.into_inner());
-                        if window.1 >= scan_rate_per_second {
-                            let elapsed = window.0.elapsed();
-                            if elapsed < Duration::from_secs(1) {
-                                thread::sleep(Duration::from_secs(1) - elapsed);
-                            }
-                            *window = (Instant::now(), 0);
+    // Phase 2: tag-read only new or changed files. Unchanged files are reused
+    // from the persistent index, which is what makes warm starts fast.
+    let mut tracks = Vec::with_capacity(audio_files.len());
+    let mut pending_reads = Vec::<(PathBuf, u64, u64)>::new();
+    let mut reused_tracks = 0usize;
+    match cached_tracks.as_ref() {
+        Some(cache) if !full_scan => {
+            for (path, size_bytes, modified_ms) in audio_files.drain(..) {
+                if let Some(track) = cache.get(&path) {
+                    if track.size_bytes == size_bytes && track.modified_ms == modified_ms {
+                        let mut track = track.clone();
+                        track.artwork = None;
+                        if track.search_text.is_empty() {
+                            track.search_text = library_search_text(&track);
                         }
-                        window.1 += 1;
+                        track.size_bytes = size_bytes;
+                        track.modified_ms = modified_ms;
+                        tracks.push(track);
+                        reused_tracks += 1;
+                        scan_progress.fetch_add(1, Ordering::Relaxed);
+                        continue;
                     }
-                    scan_progress.fetch_add(1, Ordering::Relaxed);
-                    local.push(read_track(
-                        path.clone(),
-                        &mut artwork_cache,
-                        &mut online_cover_cache,
-                    ));
                 }
-                collected
-                    .lock()
-                    .unwrap_or_else(|error| error.into_inner())
-                    .extend(local);
-            });
-        }
-    });
-    let mut tracks = collected
-        .into_inner()
-        .unwrap_or_else(|error| error.into_inner());
-
-    // Each worker had its own artwork cache; share identical cover images again
-    // so large libraries do not keep duplicate copies in memory.
-    let mut shared_artwork = HashMap::<u64, Vec<Arc<Vec<u8>>>>::new();
-    for track in &mut tracks {
-        if let Some(artwork) = track.artwork.take() {
-            let mut hasher = DefaultHasher::new();
-            artwork.as_slice().hash(&mut hasher);
-            let bucket = shared_artwork.entry(hasher.finish()).or_default();
-            if let Some(existing) = bucket
-                .iter()
-                .find(|candidate| candidate.as_slice() == artwork.as_slice())
-            {
-                track.artwork = Some(Arc::clone(existing));
-            } else {
-                bucket.push(Arc::clone(&artwork));
-                track.artwork = Some(artwork);
+                pending_reads.push((path, size_bytes, modified_ms));
             }
         }
+        _ => pending_reads = audio_files,
+    }
+    let tag_reads = pending_reads.len();
+
+    // Reading tags is the slow part of a full scan (disk I/O plus parsing), so
+    // it is spread across cores. The rate limit is shared by all workers.
+    if !pending_reads.is_empty() {
+        let worker_count = thread::available_parallelism()
+            .map_or(4, |count| count.get())
+            .clamp(2, 8)
+            .min(pending_reads.len());
+        let next_path = AtomicUsize::new(0);
+        let pacer = Mutex::new((Instant::now(), 0usize));
+        let collected: Mutex<Vec<Track>> = Mutex::new(Vec::with_capacity(pending_reads.len()));
+        thread::scope(|scope| {
+            for _ in 0..worker_count {
+                scope.spawn(|| {
+                    let mut online_cover_cache =
+                        HashMap::<(String, String), Option<Arc<Vec<u8>>>>::new();
+                    let mut local = Vec::new();
+                    loop {
+                        let position = next_path.fetch_add(1, Ordering::Relaxed);
+                        let Some((path, size_bytes, modified_ms)) = pending_reads.get(position) else {
+                            break;
+                        };
+                        if scan_rate_per_second > 0 {
+                            let mut window =
+                                pacer.lock().unwrap_or_else(|error| error.into_inner());
+                            if window.1 >= scan_rate_per_second {
+                                let elapsed = window.0.elapsed();
+                                if elapsed < Duration::from_secs(1) {
+                                    thread::sleep(Duration::from_secs(1) - elapsed);
+                                }
+                                *window = (Instant::now(), 0);
+                            }
+                            window.1 += 1;
+                        }
+                        scan_progress.fetch_add(1, Ordering::Relaxed);
+                        local.push(read_track(
+                            path.clone(),
+                            *size_bytes,
+                            *modified_ms,
+                            &mut online_cover_cache,
+                        ));
+                    }
+                    collected
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .extend(local);
+                });
+            }
+        });
+        tracks.extend(
+            collected
+                .into_inner()
+                .unwrap_or_else(|error| error.into_inner()),
+        );
     }
 
     // Cache lowercase sort keys once instead of allocating them repeatedly in
@@ -596,6 +652,34 @@ fn scan_folders_with_settings(
             track.path.clone(),
         )
     });
+    // The same vanished directory can be reported more than once by different
+    // walk steps; keep the health report readable.
+    let mut unique_errors = HashSet::new();
+    errors.retain(|error| unique_errors.insert(error.clone()));
+
+    let elapsed = scan_started.elapsed();
+    if timing_enabled() {
+        eprintln!(
+            "[lilt] scan finished: {} files · {} tag reads · {} reused · {:?}",
+            tracks.len(),
+            tag_reads,
+            reused_tracks,
+            elapsed
+        );
+    }
+    // A warm verification pass that changed nothing should not rewrite (and
+    // fsync) the index on every launch.
+    let cache_is_stale = full_scan
+        || tag_reads > 0
+        || auto_deleted_count > 0
+        || cached_tracks
+            .as_ref()
+            .is_none_or(|cache| cache.len() != tracks.len());
+    let cache_error = if save_cache && cache_is_stale {
+        save_library_cache(folders, &tracks).err()
+    } else {
+        None
+    };
     ScanResult {
         tracks,
         error: if errors.is_empty() {
@@ -611,12 +695,16 @@ fn scan_folders_with_settings(
         auto_deleted_count,
         auto_delete_failures,
         auto_deleted_paths,
+        tag_reads,
+        reused_tracks,
+        cache_error,
     }
 }
 
 fn read_track(
     path: PathBuf,
-    artwork_cache: &mut HashMap<u64, Vec<Arc<Vec<u8>>>>,
+    size_bytes: u64,
+    modified_ms: u64,
     online_cover_cache: &mut HashMap<(String, String), Option<Arc<Vec<u8>>>>,
 ) -> Track {
     let fallback_title = path
@@ -627,11 +715,9 @@ fn read_track(
     let mut track = Track {
         path: path.clone(),
         title: fallback_title,
-        added: fs::metadata(&path)
-            .and_then(|metadata| metadata.modified())
-            .ok()
-            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |duration| duration.as_secs()),
+        added: modified_ms / 1_000,
+        size_bytes,
+        modified_ms,
         ..Track::default()
     };
     if let Ok(tagged) = Probe::open(&path).and_then(|probe| probe.read()) {
@@ -646,26 +732,24 @@ fn read_track(
             track.artist = tag.artist().unwrap_or_default().to_string();
             track.album = tag.album().unwrap_or_default().to_string();
             track.genre = tag.genre().unwrap_or_default().to_string();
-            track.replay_gain_track_db = tag.get_string(&ItemKey::ReplayGainTrackGain).and_then(parse_replay_gain_db);
-            track.replay_gain_album_db = tag.get_string(&ItemKey::ReplayGainAlbumGain).and_then(parse_replay_gain_db);
-            track.artwork = tag.pictures().first().and_then(|picture| {
+            track.replay_gain_track_db = tag
+                .get_string(&ItemKey::ReplayGainTrackGain)
+                .and_then(parse_replay_gain_db);
+            track.replay_gain_album_db = tag
+                .get_string(&ItemKey::ReplayGainAlbumGain)
+                .and_then(parse_replay_gain_db);
+            // Remember whether a usable cover exists, but do not retain the
+            // bytes for the whole library. Visible rows extract covers lazily.
+            track.has_embedded_artwork = tag.pictures().first().is_some_and(|picture| {
                 let data = picture.data();
-                if data.is_empty() || data.len() > MAX_CACHED_ARTWORK_BYTES {
-                    return None;
-                }
-                let mut hasher = DefaultHasher::new();
-                data.hash(&mut hasher);
-                let bucket = artwork_cache.entry(hasher.finish()).or_default();
-                if let Some(shared) = bucket.iter().find(|candidate| candidate.as_slice() == data) {
-                    return Some(Arc::clone(shared));
-                }
-                let shared = Arc::new(data.to_vec());
-                bucket.push(Arc::clone(&shared));
-                Some(shared)
+                !data.is_empty() && data.len() <= MAX_CACHED_ARTWORK_BYTES
             });
         }
     }
-    if track.artwork.is_none() && !is_unknown(&track.album) && !is_unknown(&track.artist) {
+    if !track.has_embedded_artwork
+        && !is_unknown(&track.album)
+        && !is_unknown(&track.artist)
+    {
         let key = (track.artist.to_lowercase(), track.album.to_lowercase());
         let cached = online_cover_cache.entry(key).or_insert_with(|| {
             let path = online_artwork_cache_path(&track.artist, &track.album).ok()?;
@@ -677,12 +761,84 @@ fn read_track(
         });
         track.artwork = cached.clone();
     }
-    track.search_text = format!(
-        "{} {} {} {}",
-        track.title, track.artist, track.album, track.genre
-    )
-    .to_lowercase();
+    track.search_text = library_search_text(&track);
     track
+}
+
+fn collect_quick_play_files(path: &Path) -> (Vec<PathBuf>, bool) {
+    if path.is_file() {
+        return if is_audio_file(path) {
+            (vec![path.to_path_buf()], false)
+        } else {
+            (Vec::new(), false)
+        };
+    }
+    if !path.is_dir() {
+        return (Vec::new(), true);
+    }
+    let mut files = Vec::new();
+    let mut pending = vec![path.to_path_buf()];
+    while let Some(folder) = pending.pop() {
+        let Ok(entries) = fs::read_dir(&folder) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                pending.push(path);
+            } else if file_type.is_file() && is_audio_file(&path) {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    (files, true)
+}
+
+/// Loads only the file or folder supplied by Quick Play. It never touches the
+/// library cache or the configured library folders.
+fn load_quick_play(
+    path: PathBuf,
+    progress: Arc<AtomicUsize>,
+) -> QuickPlayResult {
+    let (files, is_folder) = collect_quick_play_files(&path);
+    if files.is_empty() {
+        return QuickPlayResult {
+            path,
+            is_folder,
+            tracks: Vec::new(),
+            error: Some(if is_folder {
+                "No supported audio files were found in that folder.".into()
+            } else {
+                "That file is not a supported audio format.".into()
+            }),
+        };
+    }
+    let mut online_cover_cache = HashMap::new();
+    let mut tracks = Vec::with_capacity(files.len());
+    for file in files {
+        let metadata = fs::metadata(&file).ok();
+        let size_bytes = metadata.as_ref().map_or(0, |metadata| metadata.len());
+        let modified_ms = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |duration| {
+                duration.as_secs().saturating_mul(1_000)
+                    + duration.subsec_millis() as u64
+            });
+        let track = read_track(file, size_bytes, modified_ms, &mut online_cover_cache);
+        tracks.push(track);
+        progress.fetch_add(1, Ordering::Relaxed);
+    }
+    QuickPlayResult {
+        path,
+        is_folder,
+        tracks,
+        error: None,
+    }
 }
 
 fn parse_replay_gain_db(value: &str) -> Option<f32> {
@@ -1929,7 +2085,7 @@ fn load_preferences() -> Result<Preferences, String> {
 }
 
 fn save_preferences(preferences: &Preferences) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(&preferences)
+    let bytes = serde_json::to_vec(preferences)
         .map_err(|error| format!("Could not encode settings: {error}"))?;
     let primary = preferences_path()?;
     match write_settings_atomically(&primary, &bytes) {
@@ -2013,28 +2169,10 @@ fn paint_cover_or_placeholder(
     if let Some(cover) = cover {
         ui.put(
             rect,
-            egui::Image::new((cover.id(), rect.size())).corner_radius(egui::CornerRadius::same(14)),
+            egui::Image::new((cover.id(), rect.size())).corner_radius(egui::CornerRadius::same(12)),
         );
     } else {
-        let palette = [
-            Color32::from_rgb(70, 38, 54),
-            Color32::from_rgb(38, 54, 72),
-            Color32::from_rgb(78, 64, 39),
-            Color32::from_rgb(55, 42, 75),
-            Color32::from_rgb(34, 69, 61),
-        ];
-        ui.painter().rect_filled(
-            rect,
-            egui::CornerRadius::same(14),
-            palette[seed % palette.len()],
-        );
-        ui.painter().text(
-            rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "♫",
-            egui::FontId::proportional((rect.width() * 0.32).clamp(20.0, 42.0)),
-            Color32::WHITE,
-        );
+        paint_cover_placeholder(ui, rect, seed);
     }
 }
 
@@ -2085,24 +2223,24 @@ fn animated_nav_item(
     accent: Color32,
 ) -> egui::Response {
     let (rect, response) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), 36.0), egui::Sense::click());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), egui::Sense::click());
     let selected_t =
         ui.ctx()
             .animate_bool_with_time(egui::Id::new(("nav-selected", id)), selected, 0.20);
     let hover_t =
         ui.ctx()
             .animate_bool_with_time(egui::Id::new(("nav-hover", id)), response.hovered(), 0.14);
-    let idle = Color32::from_rgb(12, 12, 16);
-    let hover = Color32::from_rgb(27, 29, 43);
-    let active = Color32::from_rgb(35, 39, 64);
+    let idle = SURFACE_BASE;
+    let hover = SURFACE_HOVER;
+    let active = mix_color(SURFACE_HOVER, accent, 0.16);
     let base = mix_color(idle, hover, hover_t);
     let fill = mix_color(base, active, selected_t);
     ui.painter()
-        .rect_filled(rect, egui::CornerRadius::same(18), fill);
+        .rect_filled(rect, egui::CornerRadius::same(12), fill);
     if let Some(icon) = icon {
         let icon_rect = egui::Rect::from_center_size(
-            egui::pos2(rect.left() + 27.0, rect.center().y),
-            Vec2::splat(18.0),
+            egui::pos2(rect.left() + 29.0, rect.center().y),
+            Vec2::splat(20.0),
         );
         ui.painter().image(
             icon.id(),
@@ -2113,8 +2251,8 @@ fn animated_nav_item(
     }
     if selected_t > 0.01 || hover_t > 0.01 {
         let stripe = egui::Rect::from_min_size(
-            rect.min + Vec2::new(0.0, 9.0),
-            Vec2::new(3.0 + selected_t * 1.5, rect.height() - 18.0),
+            rect.min + Vec2::new(0.0, 10.0),
+            Vec2::new(3.0 + selected_t * 1.5, rect.height() - 20.0),
         );
         ui.painter().rect_filled(
             stripe,
@@ -2123,17 +2261,25 @@ fn animated_nav_item(
         );
     }
     let text_color = mix_color(
-        Color32::from_rgb(165, 166, 178),
-        Color32::WHITE,
+        TEXT_MUTED,
+        TEXT_PRIMARY,
         selected_t.max(hover_t * 0.35),
     );
     ui.painter().text(
-        egui::pos2(rect.left() + 44.0, rect.center().y),
+        egui::pos2(rect.left() + 48.0, rect.center().y),
         egui::Align2::LEFT_CENTER,
         label,
-        egui::FontId::proportional(14.0),
+        egui::FontId::proportional(14.5),
         text_color,
     );
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect,
+            egui::CornerRadius::same(12),
+            egui::Stroke::new(1.5_f32, accent),
+            egui::StrokeKind::Inside,
+        );
+    }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
@@ -2150,26 +2296,65 @@ fn mix_color(a: Color32, b: Color32, t: f32) -> Color32 {
 
 fn main() -> eframe::Result<()> {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    let mut startup_folder = None;
-    let mut startup_file = None;
+    let mut launch = LaunchOptions::default();
+    let mut background_argument = false;
     let mut argument_index = 0;
     while argument_index < arguments.len() {
-        if arguments[argument_index] == "--folder" {
-            if let Some(folder) = arguments.get(argument_index + 1) {
-                startup_folder = Some(PathBuf::from(folder));
+        let argument = &arguments[argument_index];
+        if argument == "--quick-play" {
+            if let Some(path) = arguments.get(argument_index + 1) {
+                launch.quick_play = Some(PathBuf::from(path));
                 argument_index += 1;
             }
-        } else if startup_file.is_none() {
-            let path = PathBuf::from(&arguments[argument_index]);
+        } else if argument == "--folder" {
+            if let Some(folder) = arguments.get(argument_index + 1) {
+                launch.startup_folder = Some(PathBuf::from(folder));
+                argument_index += 1;
+            }
+        } else if argument == "--background" {
+            background_argument = true;
+        } else if argument == "--show" {
+            background_argument = false;
+        } else if launch.startup_file.is_none() {
+            let path = PathBuf::from(argument);
             if path.is_file() {
-                startup_file = Some(path);
+                launch.startup_file = Some(path);
             }
         }
         argument_index += 1;
     }
+    launch.background = background_argument;
+    let loaded_preferences = load_preferences();
+    let start_in_background = loaded_preferences
+        .as_ref()
+        .is_ok_and(|preferences| preferences.start_in_background);
+    let start_hidden = launch.quick_play.is_none()
+        && (background_argument || start_in_background);
+
+    if !acquire_single_instance() {
+        let request_path = launch
+            .quick_play
+            .clone()
+            .or_else(|| launch.startup_file.clone())
+            .or_else(|| launch.startup_folder.clone());
+        let request = request_path
+            .map(LaunchRequest::quick_play)
+            .unwrap_or_else(LaunchRequest::show);
+        let _ = send_launch_request(&request);
+        return Ok(());
+    }
+    clear_stale_launch_request();
+    if loaded_preferences
+        .as_ref()
+        .is_ok_and(|preferences| preferences.start_with_windows)
+    {
+        let _ = set_start_with_windows(true);
+    }
+
     let app_icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/app_icon.png"))
         .unwrap_or_default();
-    let start_maximized = load_preferences()
+    let start_maximized = loaded_preferences
+        .as_ref()
         .map(|preferences| preferences.start_maximized)
         .unwrap_or(true);
     let options = eframe::NativeOptions {
@@ -2178,6 +2363,7 @@ fn main() -> eframe::Result<()> {
             .with_icon(app_icon)
             .with_decorations(false)
             .with_maximized(start_maximized)
+            .with_visible(!start_hidden)
             .with_inner_size([1680.0, 1040.0])
             .with_min_inner_size([1120.0, 720.0]),
         ..Default::default()
@@ -2186,9 +2372,9 @@ fn main() -> eframe::Result<()> {
         APP_NAME,
         options,
         Box::new(move |_creation_context| {
-            Ok(Box::new(PlayerApp::new_with_folder(
-                startup_folder,
-                startup_file,
+            Ok(Box::new(PlayerApp::with_launch_options(
+                launch,
+                loaded_preferences,
             )))
         }),
     )

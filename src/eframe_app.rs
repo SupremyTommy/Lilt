@@ -1,12 +1,47 @@
 impl eframe::App for PlayerApp {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         let window_focused = ctx.input(|input| input.focused);
+        let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
+        self.maybe_flush_state();
+        if ctx.input(|input| input.viewport().close_requested()) {
+            self.flush_state();
+            if !self.force_exit && self.keep_running_in_background {
+                // Keep audio and the launch watcher alive without a window. The
+                // next launch of Lilt hands a show request to this instance.
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.status = "Lilt is still running in the background. Open Lilt again to show the window.".into();
+            }
+        }
+        if let Some(since) = self.preferences_dirty_since {
+            ctx.request_repaint_after(
+                Duration::from_millis(750).saturating_sub(since.elapsed()),
+            );
+        }
+        if !self.update_check_started {
+            if self.splash_started.elapsed() >= Duration::from_secs(2) {
+                self.start_update_check();
+            } else {
+                ctx.request_repaint_after(Duration::from_secs(2));
+            }
+        }
         self.poll_update_messages();
         self.load_ui_icons(ctx);
         #[cfg(target_os = "windows")]
         self.initialize_media_controls(frame, ctx);
-        if window_focused {
+        self.poll_launch_requests(ctx);
+        self.poll_quick_play();
+        self.poll_audio_activity();
+        // A hidden start still needs the scan to finish so the saved background
+        // source can be resolved and playback can begin.
+        let background_work = self.pending_background_start
+            || self.initial_library_loading
+            || self.quick_play_busy;
+        if window_focused || background_work || self.scan_busy {
             self.poll_scan();
+        }
+        if window_focused {
+            self.poll_duplicate_schedule(ctx);
             self.poll_home_job();
             self.poll_duplicate_scan();
             self.poll_artwork(ctx);
@@ -14,12 +49,17 @@ impl eframe::App for PlayerApp {
             self.poll_ai_mix();
             self.poll_ai_library_audit();
         }
+        self.maybe_start_background_music();
+        self.update_smart_duck(ctx);
+        if let Some(due) = self.duplicate_scan_due {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
         // Windows media-key events arrive through the system media session and
         // must be serviced even while Lilt is in the background.
         self.poll_media_key_commands();
         self.capture_status_output(ctx);
         if !self.artwork_pending.is_empty() {
-            if window_focused {
+            if window_focused && !minimized {
                 ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
@@ -153,15 +193,18 @@ impl eframe::App for PlayerApp {
             self.last_animated_page = self.page;
             self.page_animation_started = Instant::now();
         }
-        ctx.set_zoom_factor(self.ui_scale / 100.0);
+        if self.applied_zoom != Some(self.ui_scale) {
+            ctx.set_zoom_factor(self.ui_scale / 100.0);
+            self.applied_zoom = Some(self.ui_scale);
+        }
         let audio_is_playing = self
             .sink
             .as_ref()
             .is_some_and(|sink| !sink.is_paused() && !sink.empty());
-        if window_focused && audio_is_playing {
-            // A 10 FPS refresh keeps the compact equalizer/progress animation smooth
-            // while focused. While unfocused, wake only at the estimated track end.
-            ctx.request_repaint_after(Duration::from_millis(100));
+        if window_focused && audio_is_playing && !minimized {
+            // Four refreshes per second keep the progress bar and compact
+            // equalizer moving without waking the UI for every frame.
+            ctx.request_repaint_after(Duration::from_millis(250));
         } else if audio_is_playing {
             // Wake once near the end of the current song so the queue can advance
             // without polling or refreshing the UI while the player is unfocused.
@@ -187,59 +230,26 @@ impl eframe::App for PlayerApp {
                 until_fade
             };
             ctx.request_repaint_after(delay);
-        } else if window_focused && (self.scan_busy || self.duplicate_scan_busy) {
+        } else if (window_focused && (self.scan_busy || self.duplicate_scan_busy))
+            || self.pending_background_start
+            || self.quick_play_busy
+        {
             ctx.request_repaint_after(Duration::from_millis(250));
         }
-        ctx.set_visuals(egui::Visuals::dark());
+        if self.background_music_enabled {
+            // Keep sampling other apps while Lilt is hidden, so ducking reacts
+            // even when nothing else is repainting the window.
+            ctx.request_repaint_after(Duration::from_millis(450));
+        }
         let accent = accent_color(&self.accent);
-        ctx.style_mut(|style| {
-            style.animation_time = if self.animations_enabled { 0.16 } else { 0.0 };
-            style.visuals.panel_fill = Color32::from_rgb(13, 14, 20);
-            style.visuals.window_fill = Color32::from_rgb(22, 24, 33);
-            style.visuals.extreme_bg_color = Color32::from_rgb(17, 18, 25);
-            style.visuals.faint_bg_color = Color32::from_rgb(26, 28, 38);
-            style.visuals.selection.bg_fill = accent;
-            style.visuals.widgets.active.bg_fill = accent;
-            style.visuals.widgets.hovered.bg_fill = Color32::from_rgb(42, 48, 76);
-            style.visuals.widgets.inactive.bg_fill = Color32::from_rgb(25, 26, 36);
-            style.visuals.widgets.noninteractive.bg_fill = Color32::from_rgb(16, 18, 25);
-            style.visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(22, 23, 32);
-            style.visuals.widgets.noninteractive.corner_radius = egui::CornerRadius::same(12);
-            style.visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(18);
-            style.visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(18);
-            style.visuals.widgets.active.corner_radius = egui::CornerRadius::same(18);
-            style.spacing.item_spacing = if self.compact_mode {
-                Vec2::new(8.0, 6.0)
-            } else {
-                Vec2::new(12.0, 10.0)
-            };
-            style.spacing.button_padding = if self.compact_mode {
-                Vec2::new(9.0, 6.0)
-            } else {
-                Vec2::new(12.0, 8.0)
-            };
-            style.spacing.interact_size = if self.compact_mode {
-                Vec2::new(36.0, 34.0)
-            } else {
-                Vec2::new(42.0, 40.0)
-            };
-            style.interaction.selectable_labels = false;
-            style
-                .text_styles
-                .insert(egui::TextStyle::Body, egui::FontId::proportional(16.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Button, egui::FontId::proportional(15.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Small, egui::FontId::proportional(13.0));
-            style
-                .text_styles
-                .insert(egui::TextStyle::Heading, egui::FontId::proportional(30.0));
-        });
+        let theme_key = (self.accent.clone(), self.compact_mode, self.animations_enabled);
+        if self.applied_theme_key.as_ref() != Some(&theme_key) {
+            apply_app_theme(ctx, accent, self.compact_mode, self.animations_enabled);
+            self.applied_theme_key = Some(theme_key);
+        }
 
         let splash_elapsed = self.splash_started.elapsed().as_secs_f32();
-        if splash_elapsed < 0.5 {
+        if !self.warm_start && splash_elapsed < 0.5 {
             if window_focused {
                 ctx.request_repaint_after(Duration::from_millis(16));
             }
@@ -275,13 +285,13 @@ impl eframe::App for PlayerApp {
             let loading_top_bar = egui::TopBottomPanel::top("top-bar")
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(14, 15, 22))
+                        .fill(SURFACE_BASE)
                         .inner_margin(egui::Margin::symmetric(12, 5)),
                 )
                 .show(ctx, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading(
-                            RichText::new("♫ LILT  ·  SupremyTommy")
+                            RichText::new("♫ Lilt")
                                 .color(accent)
                                 .strong()
                                 .size(20.0),
@@ -302,7 +312,7 @@ impl eframe::App for PlayerApp {
                     });
                 });
             egui::CentralPanel::default()
-                .frame(egui::Frame::new().fill(Color32::from_rgb(10, 11, 17)))
+                .frame(egui::Frame::new().fill(SURFACE_BASE))
                 .show(ctx, |ui| {
                     ui.centered_and_justified(|ui| {
                         ui.vertical_centered(|ui| {
@@ -312,7 +322,7 @@ impl eframe::App for PlayerApp {
                             ui.heading("Preparing your library");
                             ui.label(
                                 RichText::new("Lilt is importing your music in the background.")
-                                    .color(Color32::GRAY),
+                                    .color(TEXT_MUTED),
                             );
                             ui.add_space(6.0);
                             ui.label(RichText::new(&self.scan_status).small().color(accent));
@@ -330,25 +340,26 @@ impl eframe::App for PlayerApp {
         let mut search_entered = false;
         let top_bar = egui::TopBottomPanel::top("top-bar")
             .exact_height(48.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(22, 24, 33)))
+            .frame(egui::Frame::new().fill(SURFACE_PANEL))
             .show(ctx, |ui| {
                 ui.set_min_height(48.0);
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(22, 24, 33))
-                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 55)))
+                    .fill(SURFACE_PANEL)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
                     .inner_margin(egui::Margin::symmetric(14, 6))
                     .show(ui, |ui| {
                 ui.horizontal(|ui| {
                     let drag = ui.add_sized(
-                        [230.0, 34.0],
+                        [250.0, 34.0],
                         egui::Label::new(
-                            RichText::new("♫ LILT  ·  SupremyTommy")
+                            RichText::new("♫ Lilt  ·  by SupremyTommy")
                                 .color(accent)
                                 .strong()
-                                .size(20.0),
+                                .size(16.0),
                         )
                         .sense(egui::Sense::click_and_drag()),
-                    );
+                    )
+                    .on_hover_text("Lilt by SupremyTommy");
                     if drag.drag_started() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::StartDrag);
                     }
@@ -415,18 +426,6 @@ impl eframe::App for PlayerApp {
                     search_rect = Some(search_response.rect);
                     if icon_text_button(
                         ui,
-                        self.ui_icons.get("queue"),
-                        format!("Queue · {} total", self.queue.len()),
-                        !self.queue_collapsed,
-                    )
-                        .on_hover_text("Total tracks in the current playback queue")
-                        .clicked()
-                    {
-                        self.queue_collapsed = !self.queue_collapsed;
-                        self.save_state();
-                    }
-                    if icon_text_button(
-                        ui,
                         self.ui_icons.get("settings"),
                         "Settings",
                         self.page == Page::Settings,
@@ -469,11 +468,18 @@ impl eframe::App for PlayerApp {
                                     .color(accent.linear_multiply(pulse)),
                             );
                         } else {
-                            ui.label(
-                                RichText::new(if self.online_artwork_status.is_empty() { &self.scan_status } else { &self.online_artwork_status })
-                                    .small()
-                                    .color(Color32::GRAY),
-                            );
+                            let status_text = if self.online_artwork_status.is_empty() {
+                                self.scan_status.clone()
+                            } else {
+                                self.online_artwork_status.clone()
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&status_text).small().color(TEXT_MUTED),
+                                )
+                                .truncate(),
+                            )
+                            .on_hover_text(status_text);
                         }
                     });
                 });
@@ -512,16 +518,16 @@ impl eframe::App for PlayerApp {
             .exact_height(88.0)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(13, 14, 20))
+                    .fill(SURFACE_BASE)
                     .inner_margin(0),
             )
             .show(ctx, |ui| {
                 ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(Color32::from_rgb(16, 17, 20))
-                    .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 40, 46)))
-                    .corner_radius(egui::CornerRadius::same(10))
-                    .inner_margin(egui::Margin::symmetric(12, 4))
+                    .fill(SURFACE_LOW)
+                    .stroke(egui::Stroke::new(1.0_f32, BORDER))
+                    .corner_radius(egui::CornerRadius::same(16))
+                    .inner_margin(egui::Margin::symmetric(16, 6))
                     .show(ui, |ui| {
                         let player_frame_response = ui.interact(
                             ui.available_rect_before_wrap(),
@@ -596,7 +602,7 @@ impl eframe::App for PlayerApp {
                             let progress_y = progress_rect.center().y;
                             let progress_end =
                                 progress_rect.left() + progress_rect.width() * progress;
-                            let track_color = Color32::from_rgb(95, 103, 107);
+                            let track_color = BORDER_STRONG;
                             let played_color = accent;
                             ui.painter().line_segment(
                                 [
@@ -624,10 +630,27 @@ impl eframe::App for PlayerApp {
                                     ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
                                 }
                             }
-                            response.on_hover_text(format!(
-                                "{} / {}",
-                                format_time(seek_seconds),
-                                format_time(duration)
+                            let hover_seek = if can_seek {
+                                response.hover_pos().and_then(|pointer| {
+                                    seek_position_from_pointer(
+                                        pointer.x,
+                                        progress_rect.left(),
+                                        progress_rect.width(),
+                                        duration,
+                                    )
+                                })
+                            } else {
+                                None
+                            };
+                            response.on_hover_text(hover_seek.map_or_else(
+                                || {
+                                    format!(
+                                        "{} / {}",
+                                        format_time(seek_seconds),
+                                        format_time(duration)
+                                    )
+                                },
+                                |position| format!("Seek to {}", format_time(position)),
                             ));
                             ui.horizontal_centered(|ui| {
                                 let (cover_rect, cover_response) =
@@ -644,17 +667,20 @@ impl eframe::App for PlayerApp {
                                         .as_ref()
                                         .map_or("Nothing playing", |track| track.title.as_str());
                                     ui.add_sized(
-                                        [190.0, 22.0],
-                                        egui::Label::new(RichText::new(title).strong()).truncate(),
+                                        [220.0, 23.0],
+                                        egui::Label::new(
+                                            RichText::new(title).strong().size(15.5),
+                                        )
+                                        .truncate(),
                                     );
                                     let artist = current_track.as_ref().map_or_else(
                                         || "Choose a mix or song".to_string(),
                                         |track| display_credit(&track.artist),
                                     );
                                     ui.add_sized(
-                                        [190.0, 18.0],
+                                        [220.0, 18.0],
                                         egui::Label::new(
-                                            RichText::new(artist).small().color(Color32::GRAY),
+                                            RichText::new(artist).small().color(TEXT_MUTED),
                                         )
                                         .truncate(),
                                     );
@@ -693,10 +719,12 @@ impl eframe::App for PlayerApp {
                                             } else {
                                                 &self.ui_icons["play"]
                                             })
-                                            .fit_to_exact_size(Vec2::splat(24.0)),
+                                            .fit_to_exact_size(Vec2::splat(24.0))
+                                            .tint(accent_text_color(accent)),
                                         )
                                         .fill(accent)
-                                        .min_size(Vec2::new(62.0 + play_animation * 4.0, 34.0)),
+                                        .corner_radius(egui::CornerRadius::same(19))
+                                        .min_size(Vec2::new(66.0 + play_animation * 4.0, 38.0)),
                                     )
                                     .on_hover_text("Play or pause (Space or Ctrl+P)")
                                     .clicked()
@@ -724,7 +752,7 @@ impl eframe::App for PlayerApp {
                                                 .tint(if current_track_liked {
                                                     accent
                                                 } else {
-                                                    Color32::from_rgb(166, 171, 184)
+                                                    TEXT_MUTED
                                                 })
                                                 .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
@@ -745,9 +773,9 @@ impl eframe::App for PlayerApp {
                                         egui::Button::image(
                                             egui::Image::new(&self.ui_icons["dislike"])
                                                 .tint(if current_track_disliked {
-                                                    Color32::from_rgb(255, 89, 100)
+                                                    DANGER
                                                 } else {
-                                                    Color32::from_rgb(166, 171, 184)
+                                                    TEXT_MUTED
                                                 })
                                                 .fit_to_exact_size(Vec2::splat(20.0)),
                                         )
@@ -771,7 +799,7 @@ impl eframe::App for PlayerApp {
                                             format_time(duration)
                                         ))
                                         .small()
-                                        .color(Color32::GRAY),
+                                        .color(TEXT_MUTED),
                                     ),
                                 );
                                 if ui
@@ -831,6 +859,13 @@ impl eframe::App for PlayerApp {
                                     if let Some(sink) = &self.sink {
                                         sink.set_volume(self.current_output_volume());
                                     }
+                                    // Persist a dragged volume once the drag ends, not on
+                                    // every intermediate slider value.
+                                    if !volume_response.dragged() {
+                                        self.save_state();
+                                    }
+                                }
+                                if volume_response.drag_stopped() {
                                     self.save_state();
                                 }
                                 if ui.button("Queue").clicked() {
@@ -863,19 +898,19 @@ impl eframe::App for PlayerApp {
                 .width_range(200.0..=300.0)
                 .frame(
                     egui::Frame::new()
-                        .fill(Color32::from_rgb(15, 16, 23))
-                        .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(38, 42, 55))),
+                        .fill(SURFACE_LOW)
+                        .stroke(egui::Stroke::new(1.0_f32, BORDER)),
                 )
                 .show(ctx, |ui| {
                     ui.add_space(4.0);
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("♫").size(24.0).strong().color(accent));
                         ui.vertical(|ui| {
-                            ui.label(RichText::new("Lilt Library").strong().size(16.0));
+                            ui.label(RichText::new("Library").strong().size(16.0));
                             ui.label(
-                                RichText::new("Your music space")
+                                RichText::new("Your collection")
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(TEXT_MUTED),
                             );
                         });
                     });
@@ -920,12 +955,7 @@ impl eframe::App for PlayerApp {
                                     ],
                                 ),
                             ] {
-                                ui.label(
-                                    RichText::new(label)
-                                        .small()
-                                        .strong()
-                                        .color(Color32::from_rgb(135, 146, 166)),
-                                );
+                                section_label(ui, label);
                                 ui.add_space(5.0);
                                 for (page, title, icon) in items {
                                     if page == Page::Lyrics && !self.lyrics_enabled {
@@ -953,7 +983,7 @@ impl eframe::App for PlayerApp {
                                         RichText::new("PLAYLISTS")
                                             .small()
                                             .strong()
-                                            .color(Color32::from_rgb(135, 146, 166)),
+                                            .color(TEXT_MUTED),
                                     )
                                     .sense(egui::Sense::click()),
                                 );
@@ -1057,6 +1087,23 @@ impl eframe::App for PlayerApp {
                         self.now_playing_expanded = false;
                     }
                     ui.add_space(2.0);
+                    if self.background_music_enabled
+                        && (self.background_started || self.sink.is_some())
+                    {
+                        ui.label(
+                            RichText::new(format!(
+                                "● Background music{}",
+                                if self.background_source_label.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", self.background_source_label)
+                                }
+                            ))
+                            .small()
+                            .color(accent),
+                        )
+                        .on_hover_text("Background music is on. Configure it in Settings → Startup & background.");
+                    }
                     ui.label(
                         RichText::new(format!(
                             "{} songs · {} folders",
@@ -1064,7 +1111,7 @@ impl eframe::App for PlayerApp {
                             self.folders.len()
                         ))
                         .small()
-                        .color(Color32::GRAY),
+                        .color(TEXT_MUTED),
                     );
                 });
         }
@@ -1131,7 +1178,7 @@ impl eframe::App for PlayerApp {
                             ui.label(
                                 RichText::new(format!("{} songs in queue", self.queue.len()))
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(TEXT_MUTED),
                             );
                         });
                         if ui
@@ -1214,7 +1261,7 @@ impl eframe::App for PlayerApp {
                             let mut delete_now_playing_file = false;
 
                             let card = egui::Frame::new()
-                                .fill(Color32::from_rgb(24, 28, 40))
+                                .fill(SURFACE_RAISED)
                                 .stroke(egui::Stroke::new(
                                     1.0_f32,
                                     accent_color(&self.accent).linear_multiply(0.35),
@@ -1229,7 +1276,7 @@ impl eframe::App for PlayerApp {
                                                         cover.id(),
                                                         Vec2::splat(56.0),
                                                     ))
-                                                    .corner_radius(egui::CornerRadius::same(14)),
+                                                    .corner_radius(egui::CornerRadius::same(12)),
                                                 );
                                         }
                                         ui.vertical(|ui| {
@@ -1249,7 +1296,7 @@ impl eframe::App for PlayerApp {
                                                 egui::Label::new(
                                                     RichText::new(format!("{artist} · {album}"))
                                                         .small()
-                                                        .color(Color32::GRAY),
+                                                        .color(TEXT_MUTED),
                                                 )
                                                 .truncate(),
                                             );
@@ -1265,7 +1312,7 @@ impl eframe::App for PlayerApp {
                                 .on_hover_text("Right-click for current track actions")
                                 .context_menu(|ui| {
                                     ui.label(RichText::new(&title).strong());
-                                    ui.label(RichText::new(&artist).small().color(Color32::GRAY));
+                                    ui.label(RichText::new(&artist).small().color(TEXT_MUTED));
                                     ui.separator();
                                     if ui.button("↻  Restart this track").clicked() {
                                         restart_now_playing = true;
@@ -1303,7 +1350,7 @@ impl eframe::App for PlayerApp {
                                         remove_now_playing_from_library = true;
                                         ui.close_menu();
                                     }
-                                    if ui.button(RichText::new("Delete audio file permanently…").color(Color32::LIGHT_RED)).clicked() {
+                                    if ui.button(RichText::new("Delete audio file permanently…").color(DANGER)).clicked() {
                                         delete_now_playing_file = true;
                                         ui.close_menu();
                                     }
@@ -1348,7 +1395,7 @@ impl eframe::App for PlayerApp {
                             ui.label(
                                 RichText::new(format!("{upcoming_count} tracks"))
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(TEXT_MUTED),
                             );
                             if upcoming_count > 0 && ui.small_button("Clear all").on_hover_text("Remove every upcoming song from the queue").clicked() {
                                 clear_upcoming = true;
@@ -1393,10 +1440,10 @@ impl eframe::App for PlayerApp {
                                 let cover = self.artwork_texture(ui.ctx(), track_index);
                                 ui.add_space(5.0);
                                 let row_response = egui::Frame::new()
-                                    .fill(Color32::from_rgb(19, 19, 23))
+                                    .fill(SURFACE_LOW)
                                     .stroke(egui::Stroke::new(
                                         1.0_f32,
-                                        Color32::from_rgb(37, 38, 45),
+                                        BORDER,
                                     ))
                                     .inner_margin(8)
                                     .corner_radius(egui::CornerRadius::same(10))
@@ -1436,7 +1483,7 @@ impl eframe::App for PlayerApp {
                                                     egui::Label::new(
                                                         RichText::new(track_artist.clone())
                                                             .small()
-                                                            .color(Color32::GRAY),
+                                                            .color(TEXT_MUTED),
                                                     )
                                                     .truncate(),
                                                 );
@@ -1457,7 +1504,7 @@ impl eframe::App for PlayerApp {
                                     .on_hover_text("Click to play · right-click for all song actions")
                                     .context_menu(|ui| {
                                         ui.label(RichText::new(&track_title).strong());
-                                        ui.label(RichText::new(&track_artist).small().color(Color32::GRAY));
+                                        ui.label(RichText::new(&track_artist).small().color(TEXT_MUTED));
                                         ui.separator();
                                         if ui.button("▶  Play this track").clicked() {
                                             play_queue_position = Some(position);
@@ -1497,7 +1544,7 @@ impl eframe::App for PlayerApp {
                                             queue_remove_from_library = Some((queue_track_path.clone(), track_title.clone()));
                                             ui.close_menu();
                                         }
-                                        if ui.button(RichText::new("Delete audio file permanently…").color(Color32::LIGHT_RED)).clicked() {
+                                        if ui.button(RichText::new("Delete audio file permanently…").color(DANGER)).clicked() {
                                             queue_delete_file = Some((queue_track_path.clone(), track_title.clone()));
                                             ui.close_menu();
                                         }
@@ -1556,7 +1603,7 @@ impl eframe::App for PlayerApp {
                             ui.label(
                                 RichText::new("Play a mix or add songs from your library.")
                                     .small()
-                                    .color(Color32::GRAY),
+                                    .color(TEXT_MUTED),
                             );
                         });
                     }
@@ -1581,7 +1628,7 @@ impl eframe::App for PlayerApp {
                     ui.label(
                         RichText::new("Local app status and errors · no API keys are logged")
                             .small()
-                            .color(Color32::GRAY),
+                            .color(TEXT_MUTED),
                     );
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -1591,7 +1638,7 @@ impl eframe::App for PlayerApp {
                         .show(ui, |ui| {
                             if self.developer_output.is_empty() {
                                 ui.label(
-                                    RichText::new("Waiting for app output…").color(Color32::GRAY),
+                                    RichText::new("Waiting for app output…").color(TEXT_MUTED),
                                 );
                             }
                             for entry in &self.developer_output {
@@ -1609,7 +1656,7 @@ impl eframe::App for PlayerApp {
         }
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::from_rgb(13, 14, 20)))
+            .frame(egui::Frame::new().fill(SURFACE_BASE))
             .show(ctx, |ui| {
                 let page_progress = if self.animations_enabled {
                     (self.page_animation_started.elapsed().as_secs_f32() / 0.21).clamp(0.0, 1.0)
@@ -1643,6 +1690,7 @@ impl eframe::App for PlayerApp {
                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(192, 69, 77)))
                             .inner_margin(egui::Margin::symmetric(14, 10))
                             .show(ui, |ui| {
+                                ui.set_max_width(460.0);
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
                                         ui.label(
@@ -1669,6 +1717,7 @@ impl eframe::App for PlayerApp {
             }
         }
 
+        self.show_quick_play_prompt(ctx);
         self.show_search_ai_window(ctx);
         self.show_properties_window(ctx);
 
@@ -1681,7 +1730,7 @@ impl eframe::App for PlayerApp {
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label("Lilt can look up missing cover art online after scanning your library.");
-                    ui.label(RichText::new("Lookups run slowly in the background, use MusicBrainz and Cover Art Archive, and are cached on this device. Track names and artist / album metadata are sent to find a match.").small().color(Color32::GRAY));
+                    ui.label(RichText::new("Lookups run slowly in the background, use MusicBrainz and Cover Art Archive, and are cached on this device. Track names and artist / album metadata are sent to find a match.").small().color(TEXT_MUTED));
                     ui.horizontal(|ui| {
                         enable = ui.add_sized([190.0, 38.0], egui::Button::new("Fetch in background")).clicked();
                         skip = ui.button("Not now").clicked();
@@ -1709,7 +1758,7 @@ impl eframe::App for PlayerApp {
                 .default_width(460.0).default_height(360.0)
                 .show(ctx, |ui| {
                     ui.heading(format!("Lilt Player {}", env!("CARGO_PKG_VERSION")));
-                    ui.label(RichText::new("Release notes").color(Color32::GRAY));
+                    ui.label(RichText::new("Release notes").color(TEXT_MUTED));
                     ui.separator();
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.heading("Search");
@@ -1817,10 +1866,10 @@ impl eframe::App for PlayerApp {
                     ui.label(
                         RichText::new(path.display().to_string())
                             .small()
-                            .color(Color32::GRAY),
+                            .color(TEXT_MUTED),
                     );
                     ui.colored_label(
-                        Color32::LIGHT_RED,
+                        DANGER,
                         "This removes the audio file from disk and cannot be undone.",
                     );
                     ui.horizontal(|ui| {
@@ -1850,12 +1899,12 @@ impl eframe::App for PlayerApp {
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label(RichText::new(format!("Permanently delete {} audio file(s) from {description}?", paths.len())).strong());
-                    ui.colored_label(Color32::LIGHT_RED, "This deletes the actual files from disk and cannot be undone. Lilt will remember these deletions to prevent accidental re-import.");
+                    ui.colored_label(DANGER, "This deletes the actual files from disk and cannot be undone. Lilt will remember these deletions to prevent accidental re-import.");
                     for path in paths.iter().take(5) {
-                        ui.label(RichText::new(path.display().to_string()).small().color(Color32::GRAY));
+                        ui.label(RichText::new(path.display().to_string()).small().color(TEXT_MUTED));
                     }
                     if paths.len() > 5 {
-                        ui.label(RichText::new(format!("…and {} more", paths.len() - 5)).small().color(Color32::GRAY));
+                        ui.label(RichText::new(format!("…and {} more", paths.len() - 5)).small().color(TEXT_MUTED));
                     }
                     ui.horizontal(|ui| {
                         confirm = ui.add_sized([164.0, 40.0], egui::Button::new("Delete all permanently")).clicked();
@@ -1934,7 +1983,7 @@ impl eframe::App for PlayerApp {
                     ui.label(
                         RichText::new("One file in each group is marked KEEP. Lilt never removes files without your confirmation.")
                             .small()
-                            .color(Color32::GRAY),
+                            .color(TEXT_MUTED),
                     );
                     if groups.is_empty() {
                         ui.add_space(12.0);
@@ -1973,12 +2022,12 @@ impl eframe::App for PlayerApp {
                                     egui::Frame::group(ui.style()).show(ui, |ui| {
                                         ui.horizontal(|ui| {
                                             ui.heading(group.kind.title());
-                                            ui.label(RichText::new(format!("{} files", group.tracks.len())).small().color(Color32::GRAY));
+                                            ui.label(RichText::new(format!("{} files", group.tracks.len())).small().color(TEXT_MUTED));
                                         });
                                         ui.label(
                                             RichText::new(group.kind.description())
                                                 .small()
-                                                .color(Color32::GRAY),
+                                                .color(TEXT_MUTED),
                                         );
                                         ui.add_space(4.0);
                                         for (track_index, track) in group.tracks.iter().enumerate() {
@@ -1998,7 +2047,7 @@ impl eframe::App for PlayerApp {
                                                         format_time(track.duration),
                                                         format_file_size(track.size_bytes),
                                                         track.path.display()
-                                                    )).small().color(Color32::GRAY));
+                                                    )).small().color(TEXT_MUTED));
                                                 });
                                             });
                                         }
@@ -2043,12 +2092,12 @@ impl eframe::App for PlayerApp {
                 .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
                 .show(ctx, |ui| {
                     ui.label(RichText::new(format!("Permanently delete {} bit-for-bit duplicate file(s)?", paths.len())).strong());
-                    ui.colored_label(Color32::LIGHT_RED, "The files will be removed from disk. One copy per duplicate group is kept. This cannot be undone.");
+                    ui.colored_label(DANGER, "The files will be removed from disk. One copy per duplicate group is kept. This cannot be undone.");
                     for path in paths.iter().take(4) {
-                        ui.label(RichText::new(path.display().to_string()).small().color(Color32::GRAY));
+                        ui.label(RichText::new(path.display().to_string()).small().color(TEXT_MUTED));
                     }
                     if paths.len() > 4 {
-                        ui.label(RichText::new(format!("…and {} more", paths.len() - 4)).small().color(Color32::GRAY));
+                        ui.label(RichText::new(format!("…and {} more", paths.len() - 4)).small().color(TEXT_MUTED));
                     }
                     ui.horizontal(|ui| {
                         confirm = ui.add_sized([160.0, 40.0], egui::Button::new("Delete permanently")).clicked();
@@ -2074,7 +2123,7 @@ impl eframe::App for PlayerApp {
                 .show(ctx, |ui| {
                     ui.label(RichText::new("Remove all remembered deletion rules?").strong());
                     ui.colored_label(
-                        Color32::LIGHT_RED,
+                        DANGER,
                         "This will stop Lilt from automatically removing those exact files if they appear again. It will not restore files already deleted.",
                     );
                     ui.horizontal(|ui| {
@@ -2087,12 +2136,20 @@ impl eframe::App for PlayerApp {
             if confirm {
                 self.deleted_songs.clear();
                 self.clear_deleted_history_confirmation = false;
-                if self.save_state() {
+                if self.flush_state() {
                     self.status = "Deleted-song history cleared.".into();
                 }
             } else if cancel {
                 self.clear_deleted_history_confirmation = false;
             }
+        }
+        if let Some(due) = self.duplicate_scan_due {
+            ctx.request_repaint_after(due.saturating_duration_since(Instant::now()));
+        }
+        if let Some(since) = self.preferences_dirty_since {
+            ctx.request_repaint_after(
+                Duration::from_millis(750).saturating_sub(since.elapsed()),
+            );
         }
         show_custom_window_resize_grips(ctx);
         show_splash_overlay(ctx, splash_elapsed);
@@ -2126,7 +2183,7 @@ impl PlayerApp {
         let accent = accent_color(&self.accent);
         egui::TopBottomPanel::top("first-run-titlebar")
             .exact_height(48.0)
-            .frame(egui::Frame::new().fill(Color32::from_rgb(17, 19, 28)))
+            .frame(egui::Frame::new().fill(SURFACE_LOW))
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     let drag = ui.add_sized(
@@ -2216,7 +2273,7 @@ impl PlayerApp {
                                                 RichText::new(format!("{}  {title}", index + 1))
                                                     .small()
                                                     .strong()
-                                                    .color(if selected { accent } else { Color32::GRAY }),
+                                                    .color(if selected { accent } else { TEXT_MUTED }),
                                             );
                                         });
                                 }
@@ -2232,14 +2289,14 @@ impl PlayerApp {
                                             ("✦", "AI stays optional", "Mix Studio only contacts Google when you ask it to make a mix."),
                                         ]) {
                                             egui::Frame::new()
-                                                .fill(Color32::from_rgb(20, 23, 33))
+                                                .fill(SURFACE_PANEL)
                                                 .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 47, 62)))
-                                                .corner_radius(egui::CornerRadius::same(14))
+                                                .corner_radius(egui::CornerRadius::same(12))
                                                 .inner_margin(egui::Margin::same(16))
                                                 .show(column, |ui| {
                                                     ui.label(RichText::new(icon).size(24.0).color(accent));
                                                     ui.label(RichText::new(title).strong());
-                                                    ui.label(RichText::new(body).small().color(Color32::GRAY));
+                                                    ui.label(RichText::new(body).small().color(TEXT_MUTED));
                                                 });
                                         }
                                     });
@@ -2250,9 +2307,9 @@ impl PlayerApp {
                                 }
                                 1 => {
                                     egui::Frame::new()
-                                        .fill(Color32::from_rgb(20, 23, 33))
+                                        .fill(SURFACE_PANEL)
                                         .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 47, 62)))
-                                        .corner_radius(egui::CornerRadius::same(14))
+                                        .corner_radius(egui::CornerRadius::same(12))
                                         .inner_margin(egui::Margin::same(18))
                                         .show(ui, |ui| {
                                             ui.label(RichText::new("MUSIC FOLDERS").small().strong().color(accent));
@@ -2276,10 +2333,10 @@ impl PlayerApp {
                                             if self.scan_busy {
                                                 ui.horizontal(|ui| {
                                                     ui.add(egui::Spinner::new());
-                                                    ui.label(RichText::new(&self.scan_status).small().color(Color32::GRAY));
+                                                    ui.label(RichText::new(&self.scan_status).small().color(TEXT_MUTED));
                                                 });
                                             } else if !self.folders.is_empty() {
-                                                ui.label(RichText::new(format!("{} songs ready", self.tracks.len())).small().color(Color32::GRAY));
+                                                ui.label(RichText::new(format!("{} songs ready", self.tracks.len())).small().color(TEXT_MUTED));
                                             }
                                         });
                                     ui.add_space(14.0);
@@ -2304,11 +2361,11 @@ impl PlayerApp {
                                                     });
                                                 } else if self.folders.is_empty() {
                                                     ui.label(RichText::new("No music folder selected yet.").strong());
-                                                    ui.label(RichText::new("Choose a folder to build your library, or finish setup and add one later in Settings.").small().color(Color32::GRAY));
+                                                    ui.label(RichText::new("Choose a folder to build your library, or finish setup and add one later in Settings.").small().color(TEXT_MUTED));
                                                 } else {
                                                     ui.label(RichText::new("Lilt didn’t find playable music in those folders.").strong());
                                                     ui.label(RichText::new(&self.status).small().color(Color32::from_rgb(224, 194, 151)));
-                                                    ui.label(RichText::new("Check that the folder contains supported audio files and that Windows can access it. You can remove a folder, choose another, or scan again.").small().color(Color32::GRAY));
+                                                    ui.label(RichText::new("Check that the folder contains supported audio files and that Windows can access it. You can remove a folder, choose another, or scan again.").small().color(TEXT_MUTED));
                                                 }
                                                 ui.add_space(8.0);
                                                 ui.horizontal(|ui| {
@@ -2339,9 +2396,9 @@ impl PlayerApp {
                                         genres.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
                                         genres.truncate(12);
                                         egui::Frame::new()
-                                            .fill(Color32::from_rgb(20, 23, 33))
+                                            .fill(SURFACE_PANEL)
                                             .stroke(egui::Stroke::new(1.0_f32, Color32::from_rgb(42, 47, 62)))
-                                            .corner_radius(egui::CornerRadius::same(14))
+                                            .corner_radius(egui::CornerRadius::same(12))
                                             .inner_margin(egui::Margin::same(18))
                                             .show(ui, |ui| {
                                                 ui.label(RichText::new("ARTISTS TO FOLLOW").small().strong().color(accent));

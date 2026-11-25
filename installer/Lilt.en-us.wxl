@@ -15,7 +15,7 @@
   <String Id="LiltOptionsDescription" Value="Select what Setup should add. You can change your default app in Windows at any time." />
   <String Id="LiltOptionStartMenu" Value="Add a Start Menu (Programs) shortcut" />
   <String Id="LiltOptionDesktop" Value="Add a Desktop shortcut" />
-  <String Id="LiltOptionExplorer" Value="Add “Open folder with Lilt” to File Explorer" />
+  <String Id="LiltOptionExplorer" Value="Add Quick Play and “Open folder with Lilt” to File Explorer" />
   <String Id="LiltOptionAudioTypes" Value="Register supported music file types with Windows" />
   <String Id="LiltOptionAudioTypesNote" Value="Registration makes Lilt available in Open with and default-app choices. It does not change your current default player." />
   <String Id="FeaturesDlg_Title" Value="Lilt Setup" />

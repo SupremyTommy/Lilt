@@ -1,6 +1,6 @@
 [package]
 name = "lilt-player"
-version = "0.2.36"
+version = "0.3.0"
 edition = "2021"
 authors = ["SupremyTommy"]
 repository = "https://github.com/SupremyTommy/Lilt"
@@ -19,5 +19,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 souvlaki = "0.7.3"
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_System_Com", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+windows = { version = "0.58", features = ["Win32_Media_Audio", "Win32_Media_Audio_Endpoints", "Win32_System_Com"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Networking_WinHttp", "Win32_Security_Credentials", "Win32_System_Com", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
